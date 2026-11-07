@@ -34,12 +34,20 @@ impl PaddedBool32 {
     }
 }
 
+struct LayerRun {
+    start: usize,
+    bounds: Bounds<ScaledPixels>,
+    max_kind: PrimitiveKind,
+    max_shared_kind: PrimitiveKind,
+}
+
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
-    layer_stack: Vec<DrawOrder>,
+    layer_depth: usize,
+    layer_run: Option<LayerRun>,
     paths: Vec<PaintedPath>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
@@ -58,7 +66,8 @@ impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
-        self.layer_stack.clear();
+        self.layer_depth = 0;
+        self.layer_run = None;
         self.paths.clear();
         self.path_paints.clear();
         self.path_tiles.clear();
@@ -76,88 +85,100 @@ impl Scene {
         self.paint_operations.len()
     }
 
-    pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
-        // A layer's primitives all take its order, whatever their kinds, so it
-        // never shares an order with what it covers, and anything covering it
-        // goes above it.
-        let order = self.primitive_bounds.insert(bounds, u8::MAX, None);
-        self.layer_stack.push(order);
-        self.paint_operations
-            .push(PaintOperation::StartLayer(bounds));
+    pub fn push_layer(&mut self) {
+        self.end_layer_run();
+        self.layer_depth += 1;
+        self.paint_operations.push(PaintOperation::StartLayer);
     }
 
     pub fn pop_layer(&mut self) {
-        self.layer_stack.pop();
+        self.end_layer_run();
+        self.layer_depth -= 1;
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
-    pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let mut primitive = primitive.into();
-        let clipped_bounds = primitive
-            .bounds()
-            .intersect(&primitive.content_mask().bounds);
+    fn end_layer_run(&mut self) {
+        let Some(run) = self.layer_run.take() else {
+            return;
+        };
+        let order = self
+            .primitive_bounds
+            .insert(run.bounds, run.max_kind, run.max_shared_kind);
+        for index in run.start..self.paint_operations.len() {
+            if let PaintOperation::Primitive(primitive) = &self.paint_operations[index] {
+                let primitive = primitive.clone();
+                self.push_primitive(primitive, order);
+            }
+        }
+    }
 
+    pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
+        let primitive = primitive.into();
+        let clipped_bounds = primitive.clipped_bounds();
         if clipped_bounds.is_empty() {
             return;
         }
 
         let kind = primitive.kind();
-        let order = self.layer_stack.last().copied().unwrap_or_else(|| {
-            self.primitive_bounds.insert(
-                clipped_bounds,
-                kind as u8,
-                Some(kind.max_shared_kind() as u8),
-            )
-        });
-        match &mut primitive {
-            Primitive::Shadow(shadow) => {
-                shadow.order = order;
-                self.shadows.push(*shadow);
-            }
-            Primitive::Quad(quad) => {
-                quad.order = order;
-                self.quads.push(*quad);
-            }
-            Primitive::Path(path) => {
-                path.order = order;
-                self.paths.push(path.clone());
-            }
-            Primitive::Underline(underline) => {
-                underline.order = order;
-                self.underlines.push(*underline);
-            }
-            Primitive::MonochromeSprite(sprite) => {
-                sprite.order = order;
-                self.monochrome_sprites.push(*sprite);
-            }
-            Primitive::SubpixelSprite(sprite) => {
-                sprite.order = order;
-                self.subpixel_sprites.push(*sprite);
-            }
-            Primitive::PolychromeSprite(sprite) => {
-                sprite.order = order;
-                self.polychrome_sprites.push(*sprite);
-            }
-            Primitive::Surface(surface) => {
-                surface.order = order;
-                self.surfaces.push(surface.clone());
-            }
+        if self.layer_depth > 0 {
+            let run = self.layer_run.get_or_insert(LayerRun {
+                start: self.paint_operations.len(),
+                bounds: clipped_bounds,
+                max_kind: kind,
+                max_shared_kind: kind.max_shared_kind(),
+            });
+            run.bounds = run.bounds.union(&clipped_bounds);
+            run.max_kind = run.max_kind.max(kind);
+            run.max_shared_kind = run.max_shared_kind.min(kind.max_shared_kind());
+        } else {
+            let order = self
+                .primitive_bounds
+                .insert(clipped_bounds, kind, kind.max_shared_kind());
+            self.push_primitive(primitive.clone(), order);
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
+    }
+
+    fn push_primitive(&mut self, primitive: Primitive, order: DrawOrder) {
+        match primitive {
+            Primitive::Shadow(shadow) => self.shadows.push(Shadow { order, ..shadow }),
+            Primitive::Quad(quad) => self.quads.push(Quad { order, ..quad }),
+            Primitive::Path(mut path) => {
+                path.order = order;
+                self.paths.push(path);
+            }
+            Primitive::Underline(underline) => {
+                self.underlines.push(Underline { order, ..underline })
+            }
+            Primitive::MonochromeSprite(sprite) => self
+                .monochrome_sprites
+                .push(MonochromeSprite { order, ..sprite }),
+            Primitive::SubpixelSprite(sprite) => self
+                .subpixel_sprites
+                .push(SubpixelSprite { order, ..sprite }),
+            Primitive::PolychromeSprite(sprite) => self
+                .polychrome_sprites
+                .push(PolychromeSprite { order, ..sprite }),
+            Primitive::Surface(mut surface) => {
+                surface.order = order;
+                self.surfaces.push(surface);
+            }
+        }
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
-                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                PaintOperation::StartLayer => self.push_layer(),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
     }
 
     pub fn finish(&mut self) {
+        debug_assert_eq!(self.layer_depth, 0, "unbalanced scene layers");
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
@@ -231,26 +252,25 @@ pub(crate) enum PrimitiveKind {
 }
 
 impl PrimitiveKind {
-    /// The last kind that a primitive of this kind can share an order with and
-    /// still be drawn over. At one order, kinds are drawn in turn, and each
-    /// kind in paint order, except sprites, which are sorted by texture.
+    /// We guarantee that overlapping primitives are drawn in paint order.
+    /// But, to improve GPU draw batching, the renderer sorts primitives that
+    /// share a draw order by kind, then by atlas texture, and only then in
+    /// paint order. So, a primitive can only share the draw order of the
+    /// topmost primitive it overlaps if that primitive's kind is at most the
+    /// one returned here. Otherwise, it needs a new draw order.
     fn max_shared_kind(self) -> Self {
         match self {
-            Self::Shadow => Self::Shadow,
-            Self::Quad => Self::Quad,
-            Self::Path => Self::Path,
-            Self::Underline => Self::Underline,
             Self::MonochromeSprite => Self::Underline,
             Self::SubpixelSprite => Self::MonochromeSprite,
             Self::PolychromeSprite => Self::SubpixelSprite,
-            Self::Surface => Self::Surface,
+            kind => kind,
         }
     }
 }
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
-    StartLayer(Bounds<ScaledPixels>),
+    StartLayer,
     EndLayer,
 }
 
@@ -293,6 +313,10 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
         }
+    }
+
+    fn clipped_bounds(&self) -> Bounds<ScaledPixels> {
+        self.bounds().intersect(&self.content_mask().bounds)
     }
 
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
@@ -972,20 +996,42 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_primitives_share_batches_when_drawn_in_paint_order() {
-        // A quad over a quad draws over it at the same order, so the underline
-        // painted between them doesn't split the quads.
+    fn layers_are_drawn_in_paint_order() {
+        // A quad painted after a layer goes above it.
         let mut scene = Scene::default();
         scene.insert_primitive(quad(0.));
-        scene.insert_primitive(underline(100.));
-        scene.insert_primitive(quad(5.));
-        assert_eq!(batch_labels(&mut scene), ["quads (2)", "underlines (1)"]);
-        assert_eq!(scene.quads[0].order, scene.quads[1].order);
-
-        // A quad over an underline must be drawn after it.
-        let mut scene = Scene::default();
+        scene.push_layer();
         scene.insert_primitive(underline(0.));
+        scene.insert_primitive(underline(5.));
+        scene.pop_layer();
         scene.insert_primitive(quad(5.));
+        assert_eq!(
+            batch_labels(&mut scene),
+            ["quads (1)", "underlines (2)", "quads (1)"]
+        );
+
+        // A layer goes above the layer painted before it.
+        let mut scene = Scene::default();
+        scene.push_layer();
+        scene.insert_primitive(underline(0.));
+        scene.pop_layer();
+        scene.push_layer();
+        scene.insert_primitive(quad(5.));
+        scene.pop_layer();
         assert_eq!(batch_labels(&mut scene), ["underlines (1)", "quads (1)"]);
+
+        // A nested layer is drawn in paint order with its parent's primitives.
+        let mut scene = Scene::default();
+        scene.push_layer();
+        scene.insert_primitive(underline(0.));
+        scene.push_layer();
+        scene.insert_primitive(quad(5.));
+        scene.pop_layer();
+        scene.insert_primitive(underline(5.));
+        scene.pop_layer();
+        assert_eq!(
+            batch_labels(&mut scene),
+            ["underlines (1)", "quads (1)", "underlines (1)"]
+        );
     }
 }
