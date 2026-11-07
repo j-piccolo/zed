@@ -4945,9 +4945,8 @@ impl Window {
             return;
         }
 
-        // Splitting a quad into its interior and the strips around it means
-        // only the strips need the border and corner shading. The interior is
-        // left out when transparent, or drawn as a plain rectangle.
+        // Splitting off the interior leaves only the strips around it for the
+        // border and corner shading.
         let outer_bounds = quad.bounds;
         let inner_bounds = Self::largest_border_interior(&quad);
 
@@ -4957,18 +4956,15 @@ impl Window {
         }
 
         if has_background {
-            let content_mask_bounds = quad.content_mask.bounds.intersect(&inner_bounds);
-            if !content_mask_bounds.is_empty() {
-                // The interior keeps the quad's bounds so gradients line up.
-                self.next_frame.scene.insert_primitive(Quad {
-                    content_mask: ContentMask {
-                        bounds: content_mask_bounds,
-                    },
-                    border_widths: Edges::default(),
-                    corner_radii: Corners::default(),
-                    ..quad
-                });
-            }
+            // The interior keeps the quad's bounds so gradients line up.
+            self.next_frame.scene.insert_primitive(Quad {
+                content_mask: ContentMask {
+                    bounds: quad.content_mask.bounds.intersect(&inner_bounds),
+                },
+                border_widths: Edges::default(),
+                corner_radii: Corners::default(),
+                ..quad
+            });
         }
 
         let strips = [
@@ -4995,15 +4991,12 @@ impl Window {
         ];
 
         for strip in strips {
-            let content_mask_bounds = quad.content_mask.bounds.intersect(&strip);
-            if !content_mask_bounds.is_empty() {
-                self.next_frame.scene.insert_primitive(Quad {
-                    content_mask: ContentMask {
-                        bounds: content_mask_bounds,
-                    },
-                    ..quad
-                });
-            }
+            self.next_frame.scene.insert_primitive(Quad {
+                content_mask: ContentMask {
+                    bounds: quad.content_mask.bounds.intersect(&strip),
+                },
+                ..quad
+            });
         }
     }
 

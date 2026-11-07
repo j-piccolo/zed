@@ -397,14 +397,6 @@ impl DirectXRenderer {
             self.draw_opaque_quads(scene.quads.len())?;
         }
 
-        self.pipelines.opaque_quad_pipeline.enable_depth_test(
-            &self
-                .devices
-                .as_ref()
-                .context("devices missing")?
-                .device_context,
-        );
-
         let mut quad_cursor: u32 = 0;
         for batch in scene.batches() {
             let _annotation = annotation
@@ -454,13 +446,6 @@ impl DirectXRenderer {
                 )
             })?;
         }
-        self.pipelines.opaque_quad_pipeline.disable_depth(
-            &self
-                .devices
-                .as_ref()
-                .context("devices missing")?
-                .device_context,
-        );
         self.discard_depth_buffer();
         Ok(())
     }
@@ -1169,6 +1154,7 @@ struct PipelineState<T> {
     fragment: ID3D11PixelShader,
     instances: StructuredBuffer<T>,
     blend_state: ID3D11BlendState,
+    depth_stencil_state: ID3D11DepthStencilState,
 }
 
 impl<T> PipelineState<T> {
@@ -1193,6 +1179,7 @@ impl<T> PipelineState<T> {
             fragment,
             instances: StructuredBuffer::new(device, label, buffer_size)?,
             blend_state,
+            depth_stencil_state: create_depth_stencil_state(device, D3D11_DEPTH_WRITE_MASK_ZERO)?,
         })
     }
 
@@ -1221,6 +1208,7 @@ impl<T> PipelineState<T> {
             &self.vertex,
             &self.fragment,
             &self.blend_state,
+            &self.depth_stencil_state,
         );
         unsafe {
             device_context.DrawInstanced(4, instance_count, 0, 0);
@@ -1246,6 +1234,7 @@ impl<T> PipelineState<T> {
             &self.vertex,
             &self.fragment,
             &self.blend_state,
+            &self.depth_stencil_state,
         );
         unsafe {
             device_context.PSSetSamplers(0, Some(sampler));
@@ -1272,9 +1261,7 @@ struct OpaqueQuadPipeline {
     vertex: ID3D11VertexShader,
     fragment: ID3D11PixelShader,
     blend_state: ID3D11BlendState,
-    depth_write_state: ID3D11DepthStencilState,
-    depth_test_state: ID3D11DepthStencilState,
-    depth_disabled_state: ID3D11DepthStencilState,
+    depth_stencil_state: ID3D11DepthStencilState,
 }
 
 impl OpaqueQuadPipeline {
@@ -1291,21 +1278,7 @@ impl OpaqueQuadPipeline {
             vertex,
             fragment,
             blend_state: create_opaque_blend_state(device)?,
-            depth_write_state: create_depth_stencil_state(
-                device,
-                true,
-                D3D11_DEPTH_WRITE_MASK_ALL,
-            )?,
-            depth_test_state: create_depth_stencil_state(
-                device,
-                true,
-                D3D11_DEPTH_WRITE_MASK_ZERO,
-            )?,
-            depth_disabled_state: create_depth_stencil_state(
-                device,
-                false,
-                D3D11_DEPTH_WRITE_MASK_ZERO,
-            )?,
+            depth_stencil_state: create_depth_stencil_state(device, D3D11_DEPTH_WRITE_MASK_ALL)?,
         })
     }
 
@@ -1322,9 +1295,9 @@ impl OpaqueQuadPipeline {
             return Ok(());
         }
         quad_pipeline.ensure_range(0, quad_count)?;
-        // The shader counts down from the batch start, so it starts at the last quad.
+        // Drawing front to back lets the depth test skip pixels that a later
+        // quad already covers.
         update_batch_start(device_context, batch_params_buffer, quad_count - 1)?;
-        unsafe { device_context.OMSetDepthStencilState(&self.depth_write_state, 0) };
         set_pipeline_state(
             device_context,
             slice::from_ref(&quad_pipeline.instances.view),
@@ -1332,17 +1305,10 @@ impl OpaqueQuadPipeline {
             &self.vertex,
             &self.fragment,
             &self.blend_state,
+            &self.depth_stencil_state,
         );
         unsafe { device_context.DrawInstanced(4, quad_count, 0, 0) };
         Ok(())
-    }
-
-    fn enable_depth_test(&self, device_context: &ID3D11DeviceContext) {
-        unsafe { device_context.OMSetDepthStencilState(&self.depth_test_state, 0) };
-    }
-
-    fn disable_depth(&self, device_context: &ID3D11DeviceContext) {
-        unsafe { device_context.OMSetDepthStencilState(&self.depth_disabled_state, 0) };
     }
 }
 
@@ -1563,7 +1529,6 @@ fn create_opaque_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> 
 #[inline]
 fn create_depth_stencil_state(
     device: &ID3D11Device,
-    depth_enable: bool,
     write_mask: D3D11_DEPTH_WRITE_MASK,
 ) -> Result<ID3D11DepthStencilState> {
     let stencil_op = D3D11_DEPTH_STENCILOP_DESC {
@@ -1573,7 +1538,7 @@ fn create_depth_stencil_state(
         StencilFunc: D3D11_COMPARISON_ALWAYS,
     };
     let desc = D3D11_DEPTH_STENCIL_DESC {
-        DepthEnable: depth_enable.into(),
+        DepthEnable: true.into(),
         DepthWriteMask: write_mask,
         DepthFunc: D3D11_COMPARISON_GREATER,
         StencilEnable: false.into(),
@@ -1717,6 +1682,7 @@ fn set_pipeline_state(
     vertex_shader: &ID3D11VertexShader,
     fragment_shader: &ID3D11PixelShader,
     blend_state: &ID3D11BlendState,
+    depth_stencil_state: &ID3D11DepthStencilState,
 ) {
     unsafe {
         device_context.VSSetShaderResources(1, Some(buffer_view));
@@ -1725,6 +1691,7 @@ fn set_pipeline_state(
         device_context.VSSetShader(vertex_shader, None);
         device_context.PSSetShader(fragment_shader, None);
         device_context.OMSetBlendState(blend_state, None, 0xFFFFFFFF);
+        device_context.OMSetDepthStencilState(depth_stencil_state, 0);
     }
 }
 

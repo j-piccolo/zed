@@ -109,14 +109,10 @@ float4 to_device_position(float2 unit_vertex, Bounds bounds) {
     return to_device_position_impl(position);
 }
 
-// Must match gpui::quad_depth. Later quads are closer, and `+ 1` reserves
-// zero for the cleared depth buffer.
 float quad_depth(uint quad_id) {
     return saturate(float(quad_id + 1u) * depth_scale);
 }
 
-// Every vertex at the same point makes a zero-area primitive, which is
-// dropped before rasterization.
 static const float4 CULLED_POSITION = float4(0.0, 0.0, 0.0, 1.0);
 
 float4 distance_from_clip_rect_impl(float2 position, Bounds clip_bounds) {
@@ -875,7 +871,6 @@ struct OpaqueQuadFragmentInput {
     nointerpolation float4 color: COLOR0;
 };
 
-// Draws quads front to back: batch_start_index is the last quad.
 OpaqueQuadFragmentInput opaque_quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
     uint quad_id = batch_start_index - instance_id;
     Quad quad = quads[quad_id];
@@ -892,8 +887,6 @@ OpaqueQuadFragmentInput opaque_quad_vertex(uint vertex_id: SV_VertexID, uint ins
 
     output.position = to_device_position_impl(vertex.position);
     output.position.z = quad_depth(quad_id);
-    // Matches the quad shader's solid-background output exactly: tag-0 quads
-    // resolve to hsla_to_rgba(solid), and alpha-1 blending is an overwrite.
     output.color = hsla_to_rgba(quad.background.solid);
     return output;
 }
