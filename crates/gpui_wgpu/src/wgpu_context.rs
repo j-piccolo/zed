@@ -1,3 +1,4 @@
+use crate::wgpu_renderer::PipelineCache;
 #[cfg(not(target_family = "wasm"))]
 use crate::{WgpuRenderer, WgpuSurfaceConfig};
 #[cfg(not(target_family = "wasm"))]
@@ -19,6 +20,7 @@ pub struct WgpuContext {
     dual_source_blending: bool,
     color_texture_format: wgpu::TextureFormat,
     errors: Arc<DeviceErrorState>,
+    pipeline_cache: Arc<Mutex<PipelineCache>>,
 }
 
 /// Errors reported by wgpu's device-wide callbacks.
@@ -319,6 +321,7 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             errors,
+            pipeline_cache: Arc::default(),
         }
     }
 
@@ -418,6 +421,7 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             errors,
+            pipeline_cache: Arc::default(),
         };
         Ok(PreparedWebGraphics { context, surface })
     }
@@ -747,6 +751,10 @@ impl WgpuContext {
     /// The device-wide error state, shared with renderers on this device.
     pub fn errors(&self) -> &Arc<DeviceErrorState> {
         &self.errors
+    }
+
+    pub(crate) fn pipeline_cache(&self) -> &Arc<Mutex<PipelineCache>> {
+        &self.pipeline_cache
     }
 }
 
