@@ -1,4 +1,5 @@
 use crate::wgpu_renderer::PipelineCache;
+use crate::wgpu_atlas::SharedAtlas;
 #[cfg(not(target_family = "wasm"))]
 use crate::{WgpuRenderer, WgpuSurfaceConfig};
 #[cfg(not(target_family = "wasm"))]
@@ -6,8 +7,8 @@ use anyhow::Context as _;
 #[cfg(not(target_family = "wasm"))]
 use gpui_util::ResultExt;
 use parking_lot::Mutex;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use wgpu::TextureFormat;
 
 #[derive(Clone)]
@@ -21,6 +22,8 @@ pub struct WgpuContext {
     color_texture_format: wgpu::TextureFormat,
     errors: Arc<DeviceErrorState>,
     pipeline_cache: Arc<Mutex<PipelineCache>>,
+    /// Weak so the atlas goes once the last window drawing with it closes.
+    shared_atlas: Arc<Mutex<Weak<SharedAtlas>>>,
 }
 
 /// Errors reported by wgpu's device-wide callbacks.
@@ -322,6 +325,7 @@ impl WgpuContext {
             color_texture_format,
             errors,
             pipeline_cache: Arc::default(),
+            shared_atlas: Arc::default(),
         }
     }
 
@@ -422,6 +426,7 @@ impl WgpuContext {
             color_texture_format,
             errors,
             pipeline_cache: Arc::default(),
+            shared_atlas: Arc::default(),
         };
         Ok(PreparedWebGraphics { context, surface })
     }
@@ -755,6 +760,21 @@ impl WgpuContext {
 
     pub(crate) fn pipeline_cache(&self) -> &Arc<Mutex<PipelineCache>> {
         &self.pipeline_cache
+    }
+
+    /// The sprite atlas shared by the windows drawing with this context.
+    pub(crate) fn shared_atlas(&self) -> Arc<SharedAtlas> {
+        let mut shared_atlas = self.shared_atlas.lock();
+        if let Some(atlas) = shared_atlas.upgrade() {
+            return atlas;
+        }
+        let atlas = SharedAtlas::new(
+            self.device.clone(),
+            self.queue.clone(),
+            self.color_texture_format,
+        );
+        *shared_atlas = Arc::downgrade(&atlas);
+        atlas
     }
 }
 
