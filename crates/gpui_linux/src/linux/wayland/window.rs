@@ -41,7 +41,7 @@ use gpui::{
     PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
     WindowKind, WindowParams, WindowVisibility,
-    layer_shell::{Anchor, LayerShellNotSupportedError},
+    layer_shell::{Anchor, LayerShellNotSupportedError, LayerShellOptions},
     popup::PopupOptions,
     px, size,
 };
@@ -143,6 +143,17 @@ pub struct WaylandWindowState {
     client_inset: Option<Pixels>,
     client_corner_radii: Corners<Pixels>,
     accesskit_adapter: Option<accesskit_unix::Adapter>,
+    // myshell: a layer surface unmapped by `minimize` (or opened with
+    // `show: false`). It keeps its renderer and swapchain, and draws nothing
+    // until `activate` maps it again.
+    layer_hidden: bool,
+    // myshell: while hidden, the compositor's configure for the next map has
+    // been acked, so `activate` can present at once.
+    layer_ready: bool,
+    // myshell: the part of a layer window that is shown
+    // (`myshell::set_layer_view`): its top-left `size`, as a surface of that
+    // size at `origin` on the output. Empty: nothing takes input or blur.
+    layer_view: Option<Bounds<i32>>,
 }
 
 pub enum WaylandSurfaceState {
@@ -204,6 +215,12 @@ impl WaylandSurfaceState {
             return Ok(WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState {
                 layer_surface,
                 anchor: options.anchor,
+                options: options.clone(),
+                size: Cell::new((width as u32, height as u32)),
+                exclusive_zone: Cell::new(
+                    options.exclusive_zone.map(|zone| f32::from(zone) as i32),
+                ),
+                exclusive_edge: Cell::new(options.exclusive_edge),
             }));
         }
 
@@ -314,6 +331,45 @@ pub struct WaylandXdgSurfaceState {
 pub struct WaylandLayerSurfaceState {
     layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
     anchor: Anchor,
+    // myshell: what the surface asked for, sent again after an unmap (the
+    // compositor resets a layer surface's state when it is unmapped).
+    options: LayerShellOptions,
+    size: Cell<(u32, u32)>,
+    exclusive_zone: Cell<Option<i32>>,
+    exclusive_edge: Cell<Option<Anchor>>,
+}
+
+impl WaylandLayerSurfaceState {
+    // myshell: everything `WaylandSurfaceState::new` set (and the layer, which
+    // it gave `get_layer_surface`), at the latest size and exclusive zone and
+    // edge.
+    fn reapply(&self) {
+        let layer_surface = &self.layer_surface;
+        // The layer too: reset, it would come back on the background.
+        if layer_surface.version() >= 2 {
+            layer_surface.set_layer(super::layer_shell::wayland_layer(self.options.layer));
+        }
+        let (width, height) = self.size.get();
+        layer_surface.set_size(width, height);
+        layer_surface.set_anchor(super::layer_shell::wayland_anchor(self.options.anchor));
+        layer_surface.set_keyboard_interactivity(
+            super::layer_shell::wayland_keyboard_interactivity(self.options.keyboard_interactivity),
+        );
+        if let Some(margin) = self.options.margin {
+            layer_surface.set_margin(
+                f32::from(margin.0) as i32,
+                f32::from(margin.1) as i32,
+                f32::from(margin.2) as i32,
+                f32::from(margin.3) as i32,
+            )
+        }
+        if let Some(zone) = self.exclusive_zone.get() {
+            layer_surface.set_exclusive_zone(zone);
+        }
+        if let Some(edge) = self.exclusive_edge.get() {
+            WaylandSurfaceState::apply_exclusive_edge(layer_surface, self.anchor, edge);
+        }
+    }
 }
 
 pub struct WaylandPopupSurfaceState {
@@ -428,14 +484,27 @@ impl WaylandSurfaceState {
         }
     }
 
+    // myshell: the size a layer window asks for once it shows all of itself
+    // again (`WaylandLayerSurfaceState::reapply`), without asking for it now.
+    fn remember_layer_size(&self, width: i32, height: i32) {
+        if let WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState { size, .. }) = self {
+            size.set((width as u32, height as u32));
+        }
+    }
+
     fn set_geometry(&self, x: i32, y: i32, width: i32, height: i32) {
         match self {
             WaylandSurfaceState::Xdg(WaylandXdgSurfaceState { xdg_surface, .. }) => {
                 xdg_surface.set_window_geometry(x, y, width, height);
             }
-            WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState { layer_surface, .. }) => {
+            WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState {
+                layer_surface,
+                size,
+                ..
+            }) => {
                 // cannot set window position of a layer surface
                 layer_surface.set_size(width as u32, height as u32);
+                size.set((width as u32, height as u32));
             }
             WaylandSurfaceState::Popup(WaylandPopupSurfaceState { xdg_surface, .. }) => {
                 xdg_surface.set_window_geometry(x, y, width, height);
@@ -469,10 +538,14 @@ impl WaylandSurfaceState {
     }
 
     fn set_exclusive_zone(&self, zone: i32) -> bool {
-        if let WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState { layer_surface, .. }) =
-            self
+        if let WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState {
+            layer_surface,
+            exclusive_zone,
+            ..
+        }) = self
         {
             layer_surface.set_exclusive_zone(zone);
+            exclusive_zone.set(Some(zone));
             true
         } else {
             false
@@ -502,9 +575,11 @@ impl WaylandSurfaceState {
         if let WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState {
             layer_surface,
             anchor,
+            exclusive_edge,
             ..
         }) = self
         {
+            exclusive_edge.set(Some(edge));
             Self::apply_exclusive_edge(layer_surface, *anchor, edge)
         } else {
             false
@@ -645,6 +720,9 @@ impl WaylandWindowState {
             client_inset: None,
             client_corner_radii: Corners::default(),
             accesskit_adapter: None,
+            layer_hidden: false,
+            layer_ready: false,
+            layer_view: None,
         })
     }
 
@@ -776,6 +854,10 @@ impl Drop for WaylandWindow {
     fn drop(&mut self) {
         self.0.frame_loop.set(FrameLoop::Parked);
 
+        // myshell: its grab popup and any shape asked for go with it.
+        let window_id = self.0.state.borrow().handle.window_id();
+        super::myshell::forget(window_id);
+
         let mut state = self.0.state.borrow_mut();
         let surface_id = state.surface.id();
 
@@ -838,6 +920,64 @@ impl WaylandWindow {
         self.0.state.borrow_mut()
     }
 
+    // myshell: unmap a layer surface (a null buffer), then at once make the
+    // initial commit of its next map, so its configure arrives and is acked
+    // while it is hidden and `show_layer` needs no round trip. The renderer
+    // stays (device, pipelines, atlas) and its swapchain shrinks to 1x1 with
+    // its path textures gone, since a hidden window draws nothing (on Asahi
+    // they are plain RAM, and a kept window spends most of its life hidden):
+    // `show_layer` gives the swapchain its size back. No frame is drawn while hidden: the frame loop is
+    // `Unconfigured`, which every wakeup ignores.
+    fn hide_layer(&self) {
+        let mut state = self.borrow_mut();
+        if state.layer_hidden {
+            return;
+        }
+        state.layer_hidden = true;
+        state.layer_ready = false;
+        // Its grab goes with it (a grab popup's root must be mapped).
+        super::myshell::end_grabs(state.handle.window_id());
+        state.pending_frame_callback = None;
+        state.presentation = PresentationState::Unpresented;
+        state.in_progress_configure = None;
+        self.0.frame_loop.set(FrameLoop::Unconfigured);
+        state.surface.attach(None, 0, 0);
+        state.surface.commit();
+        // The surface as opened (a view is set again by the next frame).
+        state.layer_view = None;
+        apply_layer_view(&state);
+        state.surface.commit();
+        if !super::myshell::keeps_swapchain(state.handle.window_id()) {
+            if let Some(renderer) = state.renderer.as_mut() {
+                renderer.park_surface();
+            }
+        }
+    }
+
+    // myshell: map a hidden layer surface again. With its configure acked,
+    // the next frame (on this turn of the event loop, not inside the caller's
+    // update) presents the window's current scene; without, the configure on
+    // its way draws it as a new window's first configure does.
+    fn show_layer(&self) {
+        let mut state = self.borrow_mut();
+        if !state.layer_hidden {
+            return;
+        }
+        state.layer_hidden = false;
+        // Its swapchain at its size again, for the frame that maps it.
+        if let Some(renderer) = state.renderer.as_mut() {
+            renderer.unpark_surface();
+        }
+        if !std::mem::take(&mut state.layer_ready) {
+            return;
+        }
+        state.redraw_requested = true;
+        state.presentation = PresentationState::RetryBeforeFirstPresent;
+        drop(state);
+        self.0.frame_loop.set(FrameLoop::Parked);
+        self.0.schedule_frame();
+    }
+
     pub fn new(
         handle: AnyWindowHandle,
         globals: Globals,
@@ -870,6 +1010,9 @@ impl WaylandWindow {
             .map(|viewporter| viewporter.get_viewport(&surface, &globals.qh, ()));
 
         let frame_ping = globals.frame_ping.clone();
+        // myshell: a layer surface opened with `show: false` takes its configure
+        // but stays unmapped until `activate`.
+        let start_hidden = !params.show && matches!(params.kind, WindowKind::LayerShell(_));
         let this = Self(WaylandWindowStatePtr {
             state: Rc::new(RefCell::new(WaylandWindowState::new(
                 handle,
@@ -889,6 +1032,17 @@ impl WaylandWindow {
             frame_ping,
             scheduled_frame_at: Rc::new(Cell::new(None)),
         });
+
+        {
+            let mut state = this.0.state.borrow_mut();
+            state.layer_hidden = start_hidden;
+            // myshell: a 1x1 swapchain until it shows (`show_layer`).
+            if start_hidden {
+                if let Some(renderer) = state.renderer.as_mut() {
+                    renderer.park_surface();
+                }
+            }
+        }
 
         // Kick things off
         surface.commit();
@@ -960,6 +1114,9 @@ impl WaylandWindowStatePtr {
             self.frame_loop.set(FrameLoop::Parked);
             return;
         };
+        // myshell: for latency work, when gpui's frame starts (input and
+        // effects it flushes first, then the views' render).
+        super::myshell::trace_frame("tick", self.state.borrow().handle.window_id());
         request_frame_callback(RequestFrameOptions {
             force_render,
             require_presentation,
@@ -1020,6 +1177,8 @@ impl WaylandWindowStatePtr {
         // Another wl_surface commit may have carried this callback while a retry
         // timer owned the render-loop wakeup.
         self.state.borrow_mut().pending_frame_callback = None;
+        super::myshell::trace_frame("shown", self.state.borrow().handle.window_id());
+        self.start_requested_grab();
         if self.frame_loop.get() == FrameLoop::AwaitingCallback {
             self.frame(signal_at, FrameRequestSource::NativeCallback);
         }
@@ -1041,6 +1200,33 @@ impl WaylandWindowStatePtr {
                 FrameRequestSource::LocalSchedule,
             );
         }
+    }
+
+    // myshell: a grab asked for (`myshell::grab_when_shown`) starts on the
+    // first compositor frame of a shown layer surface: by then the compositor
+    // has mapped it, and a grab's root must be mapped.
+    fn start_requested_grab(&self) {
+        let state = self.state.borrow();
+        if state.layer_hidden || state.presentation != PresentationState::Presented {
+            return;
+        }
+        let WaylandSurfaceState::LayerShell(layer) = &state.surface_state else {
+            return;
+        };
+        let window = state.handle.window_id();
+        let Some(on_end) = super::myshell::take_grab_request(window) else {
+            return;
+        };
+        let serial = state.client.get_serial(SerialKind::MousePress).as_raw();
+        super::myshell::start_grab(
+            self.clone(),
+            state.client.clone(),
+            window,
+            &layer.layer_surface,
+            &state.globals,
+            serial,
+            on_end,
+        );
     }
 
     pub fn is_configured(&self) -> bool {
@@ -1164,15 +1350,30 @@ impl WaylandWindowStatePtr {
             .map(|v| f32::from(v) as i32)
             .map_size(|v| if v <= 0 { 1 } else { v });
 
-            state.surface_state.set_geometry(
-                window_geometry.origin.x,
-                window_geometry.origin.y,
-                window_geometry.size.width,
-                window_geometry.size.height,
-            );
+            // myshell: a layer window showing a view keeps the view's size.
+            if state.layer_view.is_some() {
+                state.surface_state.remember_layer_size(
+                    window_geometry.size.width,
+                    window_geometry.size.height,
+                );
+            } else {
+                state.surface_state.set_geometry(
+                    window_geometry.origin.x,
+                    window_geometry.origin.y,
+                    window_geometry.size.width,
+                    window_geometry.size.height,
+                );
+            }
 
             let initial_configure = self.frame_loop.get() == FrameLoop::Unconfigured;
+            // myshell: hidden, the configure is acked for the next map; the
+            // first frame waits for `activate`.
+            let hidden = state.layer_hidden;
             update_window(state);
+            if hidden {
+                self.state.borrow_mut().layer_ready = true;
+                return;
+            }
             if initial_configure {
                 self.frame(None, FrameRequestSource::NativeCallback);
             } else {
@@ -1344,13 +1545,14 @@ impl WaylandWindowStatePtr {
                 height,
                 serial,
             } => {
-                let size = if width == 0 || height == 0 {
+                let mut state = self.state.borrow_mut();
+                // myshell: a window showing a view asked for the view's size;
+                // the window and its swapchain keep theirs.
+                let size = if width == 0 || height == 0 || state.layer_view.is_some() {
                     None
                 } else {
                     Some(size(px(width as f32), px(height as f32)))
                 };
-
-                let mut state = self.state.borrow_mut();
                 state.in_progress_configure = Some(InProgressConfigure {
                     size,
                     fullscreen: false,
@@ -1542,7 +1744,11 @@ impl WaylandWindowStatePtr {
         }
 
         let state = self.state.borrow_mut();
-        if let Some(viewport) = &state.viewport {
+        // myshell: a window showing a view keeps it (the source, in device
+        // pixels, may have changed with the scale).
+        if state.layer_view.is_some() {
+            apply_layer_view(&state);
+        } else if let Some(viewport) = &state.viewport {
             viewport.set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
         }
         update_window(state);
@@ -1791,12 +1997,20 @@ impl PlatformWindow for WaylandWindow {
         .map(|v| f32::from(v) as i32)
         .map_size(|v| if v <= 0 { 1 } else { v });
 
-        state.surface_state.set_geometry(
-            window_geometry.origin.x,
-            window_geometry.origin.y,
-            window_geometry.size.width,
-            window_geometry.size.height,
-        );
+        // myshell: a layer window showing a view keeps the view's size.
+        if state.layer_view.is_some() {
+            state.surface_state.remember_layer_size(
+                window_geometry.size.width,
+                window_geometry.size.height,
+            );
+        } else {
+            state.surface_state.set_geometry(
+                window_geometry.origin.x,
+                window_geometry.origin.y,
+                window_geometry.size.width,
+                window_geometry.size.height,
+            );
+        }
 
         state
             .globals
@@ -1865,6 +2079,11 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn activate(&self) {
+        // myshell: on a hidden layer surface, map it again.
+        if self.borrow().surface_state.layer_surface().is_some() {
+            self.show_layer();
+            return;
+        }
         let state = self.borrow();
         if let (Some(activation), Some(app_id)) = (&state.globals.activation, state.app_id.clone())
         {
@@ -1939,6 +2158,11 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn minimize(&self) {
+        // myshell: a layer surface cannot minimize; unmap it instead.
+        if self.borrow().surface_state.layer_surface().is_some() {
+            self.hide_layer();
+            return;
+        }
         if let Some(toplevel) = self.borrow().surface_state.toplevel() {
             toplevel.set_minimized();
         }
@@ -2024,6 +2248,18 @@ impl PlatformWindow for WaylandWindow {
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
         let state = &mut *state;
+        // myshell: for latency work, when gpui has laid out and painted a
+        // frame and hands its scene to the renderer (`present` follows).
+        super::myshell::trace_frame("scene", state.handle.window_id());
+        // myshell: a shape asked for while drawing this frame goes out with it.
+        if let Some(view) = super::myshell::take_layer_view(state.handle.window_id()) {
+            let view = view.map(|rect| rect.map(|v| f32::from(v).round() as i32));
+            if view != state.layer_view {
+                state.layer_view = view;
+                apply_layer_view(state);
+            }
+        }
+
         let Some(renderer) = &mut state.renderer else {
             return;
         };
@@ -2059,6 +2295,9 @@ impl PlatformWindow for WaylandWindow {
         if renderer.draw(scene) {
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
+            // myshell: for latency work (MYSHELL_FRAMES=causes), when a
+            // window's frame is handed to the compositor.
+            super::myshell::trace_frame("present", state.handle.window_id());
         } else {
             state.presentation = state.presentation.failed();
             self.0.frame_loop.set(FrameLoop::PresentationFailed);
@@ -2436,6 +2675,99 @@ mod rounded_rect_tests {
     }
 }
 
+// myshell: show `layer_view` of a layer window (all of it without one), as
+// pending state committed with the frame being drawn. A view makes the layer
+// surface its size, anchored top-left at its origin, and crops the buffer to
+// its top-left with wp_viewport, so the compositor sees a surface just that
+// size (blur, input, damage), and the window keeps its size and swapchain.
+fn apply_layer_view(state: &WaylandWindowState) {
+    let WaylandSurfaceState::LayerShell(layer) = &state.surface_state else {
+        return;
+    };
+    let compositor = &state.globals.compositor;
+    let Some(view) = state.layer_view else {
+        // The surface as opened.
+        layer.reapply();
+        if let Some(viewport) = &state.viewport {
+            viewport.set_source(-1.0, -1.0, -1.0, -1.0);
+            viewport.set_destination(
+                f32::from(state.bounds.size.width) as i32,
+                f32::from(state.bounds.size.height) as i32,
+            );
+        }
+        state.surface.set_input_region(None);
+        set_blur_area(state, None);
+        return;
+    };
+    if view.size.width <= 0 || view.size.height <= 0 {
+        // Nothing shown: no input, no blur.
+        let region = compositor.create_region(&state.globals.qh, ());
+        state.surface.set_input_region(Some(&region));
+        region.destroy();
+        set_blur_area(state, Some(view));
+        return;
+    }
+    let (width, height) = (view.size.width, view.size.height);
+    let surface = &layer.layer_surface;
+    surface.set_anchor(zwlr_layer_surface_v1::Anchor::Top | zwlr_layer_surface_v1::Anchor::Left);
+    surface.set_size(width as u32, height as u32);
+    surface.set_margin(view.origin.y, 0, 0, view.origin.x);
+    let shown = Bounds {
+        origin: Point::default(),
+        size: view.size,
+    };
+    if let Some(viewport) = &state.viewport {
+        // In buffer coordinates, within the buffer: device pixels under
+        // fractional scaling (buffer scale 1), logical ones under an integer
+        // buffer scale.
+        let (scale, limit) = if state.globals.fractional_scale_manager.is_some() {
+            let device = state.bounds.to_device_pixels(state.scale).size;
+            (state.scale, (device.width.0 as f32, device.height.0 as f32))
+        } else {
+            let logical = state.bounds.size;
+            (1.0, (f32::from(logical.width), f32::from(logical.height)))
+        };
+        viewport.set_source(
+            0.0,
+            0.0,
+            f64::from((width as f32 * scale).min(limit.0)),
+            f64::from((height as f32 * scale).min(limit.1)),
+        );
+        viewport.set_destination(width, height);
+        state.surface.set_input_region(None);
+    } else {
+        // No viewporter: the surface stays the buffer's size, so only its
+        // top-left takes input.
+        let region = compositor.create_region(&state.globals.qh, ());
+        region.add(0, 0, width, height);
+        state.surface.set_input_region(Some(&region));
+        region.destroy();
+    }
+    set_blur_area(state, Some(shown));
+}
+
+// myshell: blur `area` of the surface, rounded by the client corner radii
+// (all of it for `None`; nothing for an empty area).
+fn set_blur_area(state: &WaylandWindowState, area: Option<Bounds<i32>>) {
+    let Some(background_effects) = &state.background_effects else {
+        return;
+    };
+    let area = area.unwrap_or_else(|| {
+        state
+            .bounds
+            .map_origin(|_| px(0.0))
+            .map(|v| f32::from(v) as i32)
+    });
+    let region = state.globals.compositor.create_region(&state.globals.qh, ());
+    if area.size.width > 0 && area.size.height > 0 {
+        add_rounded_rect(area, state.client_corner_radii, |x, y, width, height| {
+            region.add(x, y, width, height);
+        });
+    }
+    background_effects.set_blur_region(Some(&region));
+    region.destroy();
+}
+
 fn update_window(mut state: RefMut<WaylandWindowState>) {
     let opaque = !state.is_transparent();
 
@@ -2492,7 +2824,15 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
                 state.background_effects = Some(background_effects);
             }
 
-            add_rounded_rect(area, state.client_corner_radii, |x, y, width, height| {
+            // myshell: only the shown part of a layer window with a view.
+            let blur_area = match state.layer_view {
+                Some(view) => Bounds {
+                    origin: Point::default(),
+                    size: view.size,
+                },
+                None => area,
+            };
+            add_rounded_rect(blur_area, state.client_corner_radii, |x, y, width, height| {
                 region.add(x, y, width, height);
             });
 

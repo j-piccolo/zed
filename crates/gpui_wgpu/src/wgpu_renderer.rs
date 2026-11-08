@@ -100,6 +100,8 @@ struct GammaParams {
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+    // myshell: the window position of the path texture's texel (0, 0) for this batch.
+    texture_origin: Point<ScaledPixels>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +111,44 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    // myshell: as `PathSprite::texture_origin`; gradients add it back to the fragment position.
+    texture_origin: Point<ScaledPixels>,
+}
+
+/// myshell: path textures grow in steps of this many device pixels, so a batch a little
+/// larger than the last does not reallocate them.
+const PATH_TEXTURE_STEP: u32 = 256;
+
+/// myshell: the device pixels a path batch draws into: the union of its paths' clipped
+/// bounds out to whole pixels, inside the frame. Its origin is the batch's texel (0, 0)
+/// in the path textures.
+fn path_batch_bounds(
+    paths: &[Path<ScaledPixels>],
+    frame: Size<DevicePixels>,
+) -> Bounds<DevicePixels> {
+    let mut bounds = paths[0].clipped_bounds();
+    for path in &paths[1..] {
+        bounds = bounds.union(&path.clipped_bounds());
+    }
+    let span = |start: f32, end: f32, frame: i32| {
+        let start = (start.floor() as i32).clamp(0, frame);
+        let end = (end.ceil() as i32).clamp(start, frame);
+        (DevicePixels(start), DevicePixels((end - start).max(1)))
+    };
+    let (x, width) = span(
+        bounds.origin.x.0,
+        bounds.origin.x.0 + bounds.size.width.0,
+        frame.width.0,
+    );
+    let (y, height) = span(
+        bounds.origin.y.0,
+        bounds.origin.y.0 + bounds.size.height.0,
+        frame.height.0,
+    );
+    Bounds {
+        origin: Point { x, y },
+        size: Size { width, height },
+    }
 }
 
 pub struct WgpuSurfaceConfig {
@@ -123,6 +163,7 @@ pub struct WgpuSurfaceConfig {
     pub preferred_present_mode: Option<wgpu::PresentMode>,
 }
 
+#[derive(Clone)]
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
@@ -156,11 +197,99 @@ struct InstanceBindings {
     polychrome_sprites: InstanceBinding,
 }
 
+#[derive(Clone)]
 struct WgpuBindGroupLayouts {
     globals: wgpu::BindGroupLayout,
     instances: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+}
+
+// myshell: compiled pipelines shared across windows.
+//
+// Upstream every renderer compiles the shaders and builds every render
+// pipeline for itself: tens of milliseconds of UI-thread CPU each time a
+// window opens (a launcher, a popup, a toast). Windows on one device with
+// the same target share them here instead. Layouts are shared with the
+// pipelines built against them. Entries hold a `Weak` to their device, so
+// a recovered device (a new `Arc`) can never match a lost one's entry, and
+// entries whose device is gone are dropped.
+
+/// What a set of pipelines is built for, beyond the device and layouts.
+#[derive(Clone, Copy, PartialEq)]
+struct PipelineKey {
+    format: wgpu::TextureFormat,
+    alpha_mode: wgpu::CompositeAlphaMode,
+    path_sample_count: u32,
+    dual_source_blending: bool,
+}
+
+struct SharedOnDevice {
+    device: std::sync::Weak<wgpu::Device>,
+    uses_webgl_instance_data: bool,
+    layouts: WgpuBindGroupLayouts,
+    pipelines: Vec<(PipelineKey, WgpuPipelines)>,
+}
+
+thread_local! {
+    static SHARED_PIPELINES: RefCell<Vec<SharedOnDevice>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The bind group layouts for `device`, made once per device.
+fn shared_layouts(device: &Arc<wgpu::Device>, uses_webgl_instance_data: bool) -> WgpuBindGroupLayouts {
+    SHARED_PIPELINES.with(|shared| {
+        let mut shared = shared.borrow_mut();
+        shared.retain(|entry| entry.device.strong_count() > 0);
+        if let Some(entry) = shared.iter().find(|entry| {
+            std::ptr::eq(entry.device.as_ptr(), Arc::as_ptr(device))
+                && entry.uses_webgl_instance_data == uses_webgl_instance_data
+        }) {
+            return entry.layouts.clone();
+        }
+        let layouts =
+            WgpuRendererCore::create_bind_group_layouts(device, uses_webgl_instance_data);
+        shared.push(SharedOnDevice {
+            device: Arc::downgrade(device),
+            uses_webgl_instance_data,
+            layouts: layouts.clone(),
+            pipelines: Vec::new(),
+        });
+        layouts
+    })
+}
+
+/// The pipelines for `key` on `device`, built against `shared_layouts`'
+/// layouts the first time any window asks.
+fn shared_pipelines(
+    device: &Arc<wgpu::Device>,
+    uses_webgl_instance_data: bool,
+    key: PipelineKey,
+) -> WgpuPipelines {
+    let layouts = shared_layouts(device, uses_webgl_instance_data);
+    SHARED_PIPELINES.with(|shared| {
+        let mut shared = shared.borrow_mut();
+        let entry = shared
+            .iter_mut()
+            .find(|entry| {
+                std::ptr::eq(entry.device.as_ptr(), Arc::as_ptr(device))
+                    && entry.uses_webgl_instance_data == uses_webgl_instance_data
+            })
+            .expect("shared_layouts made the entry");
+        if let Some((_, pipelines)) = entry.pipelines.iter().find(|(k, _)| *k == key) {
+            return pipelines.clone();
+        }
+        let pipelines = WgpuRendererCore::create_pipelines(
+            device,
+            &layouts,
+            key.format,
+            key.alpha_mode,
+            key.path_sample_count,
+            key.dual_source_blending,
+            uses_webgl_instance_data,
+        );
+        entry.pipelines.push((key, pipelines.clone()));
+        pipelines
+    })
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -262,6 +391,9 @@ pub struct WgpuRenderer {
     observed_error_generation: u64,
     last_surface_error: Option<String>,
     needs_redraw: bool,
+    /// myshell: the swapchain is 1x1 while the window is hidden
+    /// ([`WgpuRenderer::park_surface`]); `surface_config` keeps its real size.
+    parked: bool,
 }
 
 impl WgpuRenderer {
@@ -302,43 +434,58 @@ impl WgpuRenderer {
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
 
-        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-            // Fall back to the display handle already provided via InstanceDescriptor::display.
-            raw_display_handle: None,
-            raw_window_handle: window_handle.as_raw(),
-        };
-
-        // Use the existing context's instance if available, otherwise create a new one.
-        // The surface must be created with the same instance that will be used for
-        // adapter selection, otherwise wgpu will panic.
-        let instance = gpu_context
-            .borrow()
-            .as_ref()
-            .map(|ctx| ctx.instance.clone())
-            .unwrap_or_else(|| WgpuContext::instance(Some(Box::new(window.clone()))));
-
         // Safety: The caller guarantees that the window handle is valid for the
         // lifetime of this renderer. In practice, the RawWindow struct is created
         // from the native window handles and the surface is dropped before the window.
-        let surface = unsafe {
+        let create_surface = |instance: &wgpu::Instance| unsafe {
+            let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+                // Fall back to the display handle already provided via InstanceDescriptor::display.
+                raw_display_handle: None,
+                raw_window_handle: window_handle.as_raw(),
+            };
             instance
                 .create_surface_unsafe(target)
-                .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?
+                .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))
         };
 
+        // The surface must be created with the same instance that will be used for
+        // adapter selection, otherwise wgpu will panic.
         let mut ctx_ref = gpu_context.borrow_mut();
         let surface_configured = ctx_ref.is_none();
-        let context = match ctx_ref.as_mut() {
+        let (context, surface) = match ctx_ref.as_mut() {
             Some(context) => {
+                let surface = create_surface(&context.instance)?;
                 context.check_compatible_with_surface(&surface)?;
-                context
+                (context, surface)
             }
-            None => ctx_ref.insert(WgpuContext::new(
-                instance,
-                &surface,
-                &config,
-                compositor_gpu,
-            )?),
+            None => {
+                // myshell: Vulkan alone first. An instance with the GL backend
+                // brings up EGL, and Mesa's EGL loads libgallium with LLVM for
+                // llvmpipe (about 30 MB resident) even when Vulkan is chosen.
+                // GL only when no Vulkan adapter can drive the surface.
+                let mut last_error = None;
+                let mut found = None;
+                for backends in [wgpu::Backends::VULKAN, wgpu::Backends::GL] {
+                    let display = Some(Box::new(window.clone()) as _);
+                    let instance = WgpuContext::instance_with_backends(display, backends);
+                    let surface = create_surface(&instance)?;
+                    match WgpuContext::new(instance, &surface, &config, compositor_gpu) {
+                        Ok(context) => {
+                            found = Some((context, surface));
+                            break;
+                        }
+                        Err(error) => {
+                            log::info!("No {backends:?} adapter for the surface: {error:#}");
+                            last_error = Some(error);
+                        }
+                    }
+                }
+                let Some((context, surface)) = found else {
+                    return Err(last_error
+                        .unwrap_or_else(|| anyhow::anyhow!("No GPU adapter for the surface")));
+                };
+                (ctx_ref.insert(context), surface)
+            }
         };
 
         let atlas = Arc::new(WgpuAtlas::from_context(context));
@@ -515,6 +662,7 @@ impl WgpuRenderer {
             observed_error_generation: 0,
             last_surface_error: None,
             needs_redraw: false,
+            parked: false,
         })
     }
 }
@@ -1056,19 +1204,13 @@ impl WgpuRenderer {
             warn!("Failed to poll device during resize: {e:?}");
         }
 
-        // Destroy old textures before allocating new ones to avoid GPU memory spikes
-        if let Some(ref texture) = resources.path_intermediate_texture {
-            texture.destroy();
-        }
-        if let Some(ref texture) = resources.path_msaa_texture {
-            texture.destroy();
-        }
+        // myshell: the path textures are sized to path batches, not the window, so they
+        // survive a resize (`release_path_textures` frees them).
 
-        // Invalidate intermediate textures - they will be lazily recreated
-        // in draw() after we confirm the surface is healthy. This avoids
-        // panics when the device/surface is in an invalid state during resize.
-        resources.invalidate_intermediate_textures();
-
+        // myshell: a parked swapchain takes the new size when it is unparked.
+        if self.parked {
+            return;
+        }
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
         }
@@ -1097,16 +1239,22 @@ impl WgpuRenderer {
             return;
         };
         let resources = &mut core.resources;
-        resources.pipelines = WgpuRendererCore::create_pipelines(
+        // myshell: shared across windows, see `shared_pipelines`.
+        resources.pipelines = shared_pipelines(
             &resources.device,
-            &resources.bind_group_layouts,
-            format,
-            new_alpha_mode,
-            core.rendering_params.path_sample_count,
-            core.dual_source_blending,
             core.uses_webgl_instance_data,
+            PipelineKey {
+                format,
+                alpha_mode: new_alpha_mode,
+                path_sample_count: core.rendering_params.path_sample_count,
+                dual_source_blending: core.dual_source_blending,
+            },
         );
 
+        // myshell: a parked swapchain takes the new mode when it is unparked.
+        if self.parked {
+            return;
+        }
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
         }
@@ -1163,6 +1311,15 @@ impl WgpuRenderer {
         let RendererState::Ready { surface, core } = &mut self.state else {
             return false;
         };
+
+        // myshell: the atlas is shared by every window on the device. When
+        // another window cleared it, this scene may name tiles that are gone
+        // or reused, so skip it and repaint in full, as the window that
+        // cleared it does.
+        if self.atlas.take_cleared() {
+            self.needs_redraw = true;
+            return false;
+        }
 
         if let Some(error) = self.last_surface_error.take().or_else(|| {
             self.device_errors
@@ -1249,15 +1406,17 @@ impl WgpuRendererCore {
         let uses_webgl_instance_data = context.uses_webgl_instance_data();
         let dual_source_blending =
             context.supports_dual_source_blending() && !uses_webgl_instance_data;
-        let bind_group_layouts = Self::create_bind_group_layouts(&device, uses_webgl_instance_data);
-        let pipelines = Self::create_pipelines(
+        // myshell: shared across windows, see `shared_pipelines`.
+        let bind_group_layouts = shared_layouts(&device, uses_webgl_instance_data);
+        let pipelines = shared_pipelines(
             &device,
-            &bind_group_layouts,
-            target_format,
-            alpha_mode,
-            rendering_params.path_sample_count,
-            dual_source_blending,
             uses_webgl_instance_data,
+            PipelineKey {
+                format: target_format,
+                alpha_mode,
+                path_sample_count: rendering_params.path_sample_count,
+                dual_source_blending,
+            },
         );
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
@@ -1402,19 +1561,30 @@ impl WgpuRendererCore {
         &mut self.resources
     }
 
-    /// Path rendering goes through an intermediate texture that must match the frame
-    /// target's dimensions, so the textures are keyed by size and rebuilt on mismatch.
-    fn ensure_intermediate_textures(&mut self, size: Size<DevicePixels>) {
-        let width = size.width.0 as u32;
-        let height = size.height.0 as u32;
-        if self
+    /// myshell: path batches rasterize into an intermediate texture (and its MSAA
+    /// counterpart) at their own bounds, not the window's, so the textures need only fit
+    /// the largest batch. They are kept between frames and only grow: in
+    /// `PATH_TEXTURE_STEP`s, capped at the frame, and never below `needed`.
+    fn ensure_path_textures(&mut self, needed: Size<DevicePixels>, frame: Size<DevicePixels>) {
+        let (current_width, current_height) = self
             .resources
             .path_intermediate_texture
             .as_ref()
-            .is_some_and(|texture| texture.width() == width && texture.height() == height)
-        {
+            .map_or((0, 0), |texture| (texture.width(), texture.height()));
+        let needed_width = needed.width.0.max(1) as u32;
+        let needed_height = needed.height.0.max(1) as u32;
+        if needed_width <= current_width && needed_height <= current_height {
             return;
         }
+        let grow = |current: u32, needed: u32, frame: i32| {
+            needed
+                .next_multiple_of(PATH_TEXTURE_STEP)
+                .min(frame.max(1) as u32)
+                .max(needed)
+                .max(current)
+        };
+        let width = grow(current_width, needed_width, frame.width.0);
+        let height = grow(current_height, needed_height, frame.height.0);
 
         let format = self.target_format;
         let path_sample_count = self.rendering_params.path_sample_count;
@@ -1458,7 +1628,6 @@ impl WgpuRendererCore {
         );
 
         self.atlas.before_frame();
-        self.ensure_intermediate_textures(size);
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1492,7 +1661,7 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, clear_color)
+        self.record_frame(scene, target_view, size, clear_color)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
@@ -1503,6 +1672,7 @@ impl WgpuRendererCore {
         &mut self,
         scene: &Scene,
         frame_view: &wgpu::TextureView,
+        frame_size: Size<DevicePixels>,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset = 0;
@@ -1520,7 +1690,10 @@ impl WgpuRendererCore {
                     scene.polychrome_sprites.len(),
                 )
             })?;
-        self.prepare_texture_bind_groups(scene);
+        let path_texture_size = self.prepare_texture_bind_groups(scene, frame_size);
+        if let Some(size) = path_texture_size {
+            self.ensure_path_textures(size, frame_size);
+        }
 
         let mut encoder =
             self.resources()
@@ -1566,9 +1739,12 @@ impl WgpuRendererCore {
                         }
 
                         drop(pass);
+                        let batch_bounds = path_batch_bounds(paths, frame_size);
                         let rasterized = self.draw_paths_to_intermediate(
                             &mut encoder,
                             paths,
+                            batch_bounds.origin,
+                            frame_size,
                             &mut instance_offset,
                         )?;
 
@@ -1590,6 +1766,7 @@ impl WgpuRendererCore {
                         if rasterized {
                             self.draw_paths_from_intermediate(
                                 paths,
+                                batch_bounds.origin,
                                 &mut instance_offset,
                                 &mut pass,
                             )?;
@@ -1710,13 +1887,28 @@ impl WgpuRendererCore {
             })
     }
 
-    fn prepare_texture_bind_groups(&mut self, scene: &Scene) {
+    /// Also returns the path texture size the frame's largest path batch needs (myshell),
+    /// from the same walk over the batches.
+    fn prepare_texture_bind_groups(
+        &mut self,
+        scene: &Scene,
+        frame_size: Size<DevicePixels>,
+    ) -> Option<Size<DevicePixels>> {
         let mut texture_ids = SmallVec::<[AtlasTextureId; 8]>::new();
+        let mut path_texture_size: Option<Size<DevicePixels>> = None;
         for batch in scene.batches() {
             let texture_id = match batch {
                 PrimitiveBatch::MonochromeSprites { texture_id, .. }
                 | PrimitiveBatch::SubpixelSprites { texture_id, .. }
                 | PrimitiveBatch::PolychromeSprites { texture_id, .. } => texture_id,
+                PrimitiveBatch::Paths(range) if !range.is_empty() => {
+                    let size = path_batch_bounds(&scene.paths[range], frame_size).size;
+                    path_texture_size = Some(path_texture_size.map_or(size, |largest| Size {
+                        width: largest.width.max(size.width),
+                        height: largest.height.max(size.height),
+                    }));
+                    continue;
+                }
                 _ => continue,
             };
             if !texture_ids.contains(&texture_id) {
@@ -1754,6 +1946,7 @@ impl WgpuRendererCore {
                 },
             );
         }
+        path_texture_size
     }
 
     fn draw_instances(
@@ -1816,9 +2009,14 @@ impl WgpuRendererCore {
     fn draw_paths_from_intermediate(
         &mut self,
         paths: &[Path<ScaledPixels>],
+        texture_origin: Point<DevicePixels>,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> Result<()> {
+        let texture_origin = Point {
+            x: ScaledPixels(texture_origin.x.0 as f32),
+            y: ScaledPixels(texture_origin.y.0 as f32),
+        };
         let first_path = &paths[0];
         let sprites: Vec<PathSprite> = if paths.last().map(|p| &p.order) == Some(&first_path.order)
         {
@@ -1826,6 +2024,7 @@ impl WgpuRendererCore {
                 .iter()
                 .map(|p| PathSprite {
                     bounds: p.clipped_bounds(),
+                    texture_origin,
                 })
                 .collect()
         } else {
@@ -1833,7 +2032,10 @@ impl WgpuRendererCore {
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            vec![PathSprite { bounds }]
+            vec![PathSprite {
+                bounds,
+                texture_origin,
+            }]
         };
 
         let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
@@ -1861,8 +2063,14 @@ impl WgpuRendererCore {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         paths: &[Path<ScaledPixels>],
+        texture_origin: Point<DevicePixels>,
+        frame_size: Size<DevicePixels>,
         instance_offset: &mut u64,
     ) -> Result<bool> {
+        let origin = Point {
+            x: ScaledPixels(texture_origin.x.0 as f32),
+            y: ScaledPixels(texture_origin.y.0 as f32),
+        };
         let mut vertices = Vec::new();
         for path in paths {
             let bounds = path.clipped_bounds();
@@ -1871,6 +2079,7 @@ impl WgpuRendererCore {
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                texture_origin: origin,
             }));
         }
 
@@ -1903,7 +2112,13 @@ impl WgpuRendererCore {
                     resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
+                        // myshell: with a resolve target only the resolved intermediate is
+                        // read, so the MSAA samples need not be written back to memory.
+                        store: if resolve_target.is_some() {
+                            wgpu::StoreOp::Discard
+                        } else {
+                            wgpu::StoreOp::Store
+                        },
                     },
                     depth_slice: None,
                 })],
@@ -1911,6 +2126,17 @@ impl WgpuRendererCore {
                 ..Default::default()
             });
 
+            // myshell: the vertex shader still maps window positions over the whole frame;
+            // the viewport shifts the frame so the batch's origin lands on texel (0, 0).
+            // The texture is at least the batch's size, so nothing in it is lost.
+            pass.set_viewport(
+                -origin.x.0,
+                -origin.y.0,
+                frame_size.width.0 as f32,
+                frame_size.height.0 as f32,
+                0.0,
+                1.0,
+            );
             pass.set_pipeline(&resources.pipelines.path_rasterization);
             pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
             pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
@@ -2150,6 +2376,16 @@ impl WgpuRenderer {
         }
     }
 
+    /// myshell: frees the path rasterization textures (intermediate and MSAA). They
+    /// outlive frames so drawing paths does not allocate each frame; call this when the
+    /// window stops drawing (hidden) to give their memory back. The next frame that draws
+    /// a path allocates them again. Work already submitted keeps its own references.
+    pub fn release_path_textures(&mut self) {
+        if let Some(core) = self.core_mut() {
+            core.resources.invalidate_intermediate_textures();
+        }
+    }
+
     /// Replace the wgpu surface with a new one (e.g. after Android destroys
     /// and recreates the native window).  Keeps the device, queue, atlas, and
     /// all pipelines intact so cached `AtlasTextureId`s remain valid.
@@ -2205,6 +2441,39 @@ impl WgpuRenderer {
         self.state = RendererState::Ready { surface, core };
 
         Ok(())
+    }
+
+    /// myshell: shrink the swapchain of a window that is hidden to 1x1 and
+    /// free its path textures, keeping its surface, device, pipelines and
+    /// atlas. A hidden window draws nothing, so its window-sized images (the
+    /// launcher's 4 x 3.9 MB, a sheet window's 4 x 6.6 MB, all RAM on Asahi)
+    /// would only sit there. Dropping the surface instead would give back
+    /// the same memory, but a new Vulkan Wayland surface costs Mesa round
+    /// trips to the compositor on the next show (13-18 ms before the first
+    /// frame); resizing the swapchain of the surface kept does not.
+    pub fn park_surface(&mut self) {
+        if self.parked {
+            return;
+        }
+        if let RendererState::Ready { surface, core } = &mut self.state {
+            let mut tiny = self.surface_config.clone();
+            tiny.width = 1;
+            tiny.height = 1;
+            surface.configure(&core.resources.device, &tiny);
+            core.resources.invalidate_intermediate_textures();
+            self.parked = true;
+        }
+    }
+
+    /// myshell: the swapchain back at the window's size, for the frame that
+    /// shows it ([`park_surface`](Self::park_surface)).
+    pub fn unpark_surface(&mut self) {
+        if !std::mem::take(&mut self.parked) {
+            return;
+        }
+        if let RendererState::Ready { surface, core } = &self.state {
+            surface.configure(&core.resources.device, &self.surface_config);
+        }
     }
 
     pub fn destroy(&mut self) {
@@ -2831,8 +3100,8 @@ mod tests {
     fn webgl_record_sizes_match_shader_word_strides() {
         assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
-        assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 28 * 4);
+        assert_eq!(std::mem::size_of::<PathSprite>(), 6 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);

@@ -460,7 +460,15 @@ impl WgpuContext {
                 label: Some("gpui_device"),
                 required_features,
                 required_limits,
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                // myshell: 4 MB blocks, not MemoryUsage's 8-64 MB. The
+                // allocator keeps a memory type's last block when it empties
+                // and grows each new one, so a bar whose windows mostly sit
+                // hidden held 60 MB of blocks around a few MB of buffers.
+                // Anything larger than a block (a window-sized texture) gets
+                // memory of its own, given back when it is dropped.
+                memory_hints: wgpu::MemoryHints::Manual {
+                    suballocated_device_memory_block_size: (4 << 20)..(4 << 20),
+                },
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 default_queue: wgpu::QueueDescriptor::default(),
@@ -478,8 +486,18 @@ impl WgpuContext {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>) -> wgpu::Instance {
+        Self::instance_with_backends(display, wgpu::Backends::VULKAN | wgpu::Backends::GL)
+    }
+
+    /// myshell: an instance of only `backends`, so a window can try Vulkan
+    /// before bringing up GL (EGL and llvmpipe) at all.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn instance_with_backends(
+        display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>,
+        backends: wgpu::Backends,
+    ) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),

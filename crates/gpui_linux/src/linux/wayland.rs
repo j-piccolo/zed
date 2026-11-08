@@ -2,6 +2,8 @@ mod client;
 mod clipboard;
 mod cursor;
 mod display;
+/// myshell: shaped and grabbing layer windows.
+pub mod myshell;
 mod popup;
 mod serial;
 mod window;

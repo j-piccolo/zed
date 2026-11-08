@@ -1,13 +1,120 @@
 use anyhow::{Context as _, Result};
+use collections::{FxHashMap, FxHashSet};
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
     AtlasBackend, AtlasKey, AtlasState, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
     AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, Size,
 };
 use parking_lot::Mutex;
-use std::{borrow::Cow, ops, sync::Arc};
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    ops,
+    sync::{Arc, Weak},
+};
 
 use crate::WgpuContext;
+
+// myshell: one atlas per device, shared by every window on it.
+//
+// Upstream each window's renderer owns an atlas: its own textures, holding
+// the same glyphs and icons as every other window's, each rasterized again
+// for every window that opens. Here the tiles and textures live once per
+// device (`DeviceAtlas`) and a window's `WgpuAtlas` is a handle onto them,
+// so a glyph or SVG is rasterized and uploaded once for the process.
+//
+// - Glyphs and SVGs stay for the atlas's life, as in a long-lived window
+//   upstream (gpui never removes them).
+// - Images are removed (`App::drop_image` asks every window). A tile is
+//   freed once no window holds it: each handle records the image keys it
+//   inserted, and the device atlas counts holders per key. A window only
+//   loses an image it removed itself, as upstream; a closing window
+//   releases what it held.
+// - Uploads are queued on the device atlas, and every window flushes the
+//   queue before it draws, so whichever window draws first after a tile is
+//   made writes it, once, ahead of any submission that samples it.
+// - New textures and reused ids carry an atlas-wide generation, which each
+//   renderer's bind groups are keyed by.
+// - `clear` (repeated GPU errors) empties the device atlas for all windows
+//   and bumps its epoch. A window that sees a new epoch drops its stale
+//   scene and repaints in full (`take_cleared`), and its held keys from
+//   before are forgotten rather than released twice.
+// - After a device loss each window's handle moves to the new device's
+//   atlas; the lost one is dropped with its last handle. The registry holds
+//   only `Weak`s, and an entry matches only its own device's allocation, so
+//   a recreated device never meets a lost device's atlas.
+
+/// The tiles and textures on one device, shared by its windows.
+struct DeviceAtlas {
+    device: Weak<wgpu::Device>,
+    color_texture_format: wgpu::TextureFormat,
+    state: Mutex<DeviceAtlasState>,
+}
+
+struct DeviceAtlasState {
+    tiles: AtlasState<WgpuAtlasTextures>,
+    /// How many windows hold each image tile.
+    image_holders: FxHashMap<AtlasKey, u32>,
+    /// Bumped each time the atlas is cleared.
+    epoch: u64,
+}
+
+impl DeviceAtlasState {
+    fn release_image(&mut self, key: &AtlasKey) {
+        let Some(holders) = self.image_holders.get_mut(key) else {
+            return;
+        };
+        *holders -= 1;
+        if *holders == 0 {
+            self.image_holders.remove(key);
+            self.tiles.remove(key);
+        }
+    }
+}
+
+thread_local! {
+    static DEVICE_ATLASES: RefCell<Vec<Weak<DeviceAtlas>>> = const { RefCell::new(Vec::new()) };
+}
+
+impl DeviceAtlas {
+    /// The atlas for `device`, made when its first window asks.
+    fn shared(
+        device: &Arc<wgpu::Device>,
+        queue: &Arc<wgpu::Queue>,
+        color_texture_format: wgpu::TextureFormat,
+    ) -> Arc<Self> {
+        DEVICE_ATLASES.with(|atlases| {
+            let mut atlases = atlases.borrow_mut();
+            atlases.retain(|atlas| atlas.strong_count() > 0);
+            if let Some(atlas) = atlases.iter().filter_map(Weak::upgrade).find(|atlas| {
+                std::ptr::eq(atlas.device.as_ptr(), Arc::as_ptr(device))
+                    && atlas.color_texture_format == color_texture_format
+            }) {
+                return atlas;
+            }
+            let max_texture_size = device.limits().max_texture_dimension_2d;
+            let atlas = Arc::new(DeviceAtlas {
+                device: Arc::downgrade(device),
+                color_texture_format,
+                state: Mutex::new(DeviceAtlasState {
+                    tiles: AtlasState::new(WgpuAtlasTextures {
+                        device: device.clone(),
+                        queue: queue.clone(),
+                        max_texture_size,
+                        color_texture_format,
+                        storage: WgpuAtlasStorage::default(),
+                        pending_uploads: Vec::new(),
+                        next_texture_generation: 0,
+                    }),
+                    image_holders: FxHashMap::default(),
+                    epoch: 0,
+                }),
+            });
+            atlases.push(Arc::downgrade(&atlas));
+            atlas
+        })
+    }
+}
 
 fn device_size_to_etagere(size: Size<DevicePixels>) -> etagere::Size {
     size2(size.width.0, size.height.0)
@@ -20,7 +127,42 @@ fn etagere_point_to_device(point: etagere::Point) -> Point<DevicePixels> {
     }
 }
 
-pub struct WgpuAtlas(Mutex<AtlasState<WgpuAtlasTextures>>);
+/// A window's handle onto its device's shared atlas.
+pub struct WgpuAtlas(Mutex<WindowAtlas>);
+
+struct WindowAtlas {
+    shared: Arc<DeviceAtlas>,
+    /// Image keys this window inserted and has not removed.
+    images: FxHashSet<AtlasKey>,
+    /// The shared epoch `images` belongs to.
+    images_epoch: u64,
+    /// The shared epoch this window last drew in.
+    drawn_epoch: u64,
+}
+
+impl WindowAtlas {
+    fn join(shared: Arc<DeviceAtlas>) -> Self {
+        let epoch = shared.state.lock().epoch;
+        WindowAtlas {
+            shared,
+            images: FxHashSet::default(),
+            images_epoch: epoch,
+            drawn_epoch: epoch,
+        }
+    }
+
+    /// Releases every image this window holds.
+    fn release_images(&mut self) {
+        let mut state = self.shared.state.lock();
+        if self.images_epoch == state.epoch {
+            for key in self.images.drain() {
+                state.release_image(&key);
+            }
+        }
+        self.images.clear();
+        self.images_epoch = state.epoch;
+    }
+}
 
 struct PendingUpload {
     id: AtlasTextureId,
@@ -45,21 +187,18 @@ pub struct WgpuTextureInfo {
 }
 
 impl WgpuAtlas {
+    /// A handle onto the atlas `device`'s windows share, made if this is the
+    /// first.
     pub fn new(
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
         color_texture_format: wgpu::TextureFormat,
     ) -> Self {
-        let max_texture_size = device.limits().max_texture_dimension_2d;
-        WgpuAtlas(Mutex::new(AtlasState::new(WgpuAtlasTextures {
-            device,
-            queue,
-            max_texture_size,
+        WgpuAtlas(Mutex::new(WindowAtlas::join(DeviceAtlas::shared(
+            &device,
+            &queue,
             color_texture_format,
-            storage: WgpuAtlasStorage::default(),
-            pending_uploads: Vec::new(),
-            next_texture_generation: 0,
-        })))
+        ))))
     }
 
     pub fn from_context(context: &WgpuContext) -> Self {
@@ -70,9 +209,11 @@ impl WgpuAtlas {
         )
     }
 
+    /// Writes every window's queued uploads, so all tiles handed out so far
+    /// are on the queue ahead of this frame.
     pub fn before_frame(&self) {
-        let mut lock = self.0.lock();
-        lock.backend.flush_uploads();
+        let window = self.0.lock();
+        window.shared.state.lock().tiles.backend.flush_uploads();
     }
 
     /// Returns the view backing `id`, or `None` once every tile in it has been
@@ -80,8 +221,9 @@ impl WgpuAtlas {
     /// replays a paint from before the image was dropped, so callers must skip
     /// those sprites rather than assume the texture exists.
     pub fn get_texture_info(&self, id: AtlasTextureId) -> Option<WgpuTextureInfo> {
-        let lock = self.0.lock();
-        let texture = lock.backend.storage.get(id)?;
+        let window = self.0.lock();
+        let state = window.shared.state.lock();
+        let texture = state.tiles.backend.storage.get(id)?;
         Some(WgpuTextureInfo {
             view: texture.view.clone(),
             generation: texture.generation,
@@ -90,23 +232,50 @@ impl WgpuAtlas {
 
     /// Clears all cached textures and tiles, forcing them to be recreated.
     /// Use this for incremental recovery when the device is still valid.
+    ///
+    /// The tiles are every window's: the others see it in [`Self::take_cleared`].
     pub fn clear(&self) {
-        self.0.lock().clear(|textures| {
-            textures.storage = WgpuAtlasStorage::default();
-            textures.pending_uploads.clear();
-        });
+        let mut window = self.0.lock();
+        let epoch = {
+            let mut state = window.shared.state.lock();
+            state.tiles.clear(|textures| {
+                textures.storage = WgpuAtlasStorage::default();
+                textures.pending_uploads.clear();
+            });
+            state.image_holders.clear();
+            state.epoch += 1;
+            state.epoch
+        };
+        window.images.clear();
+        window.images_epoch = epoch;
+        window.drawn_epoch = epoch;
     }
 
-    /// Handles device lost by clearing all textures and cached tiles.
-    /// The atlas will lazily recreate textures as needed on subsequent frames.
+    /// Whether another window cleared the atlas since this one last asked.
+    /// Its scene may then name tiles that are gone, so it must repaint in
+    /// full before drawing.
+    pub fn take_cleared(&self) -> bool {
+        let mut window = self.0.lock();
+        let epoch = window.shared.state.lock().epoch;
+        std::mem::replace(&mut window.drawn_epoch, epoch) != epoch
+    }
+
+    /// Handles device lost by moving to the atlas for `context`'s device.
+    /// Textures there are made lazily as this window repaints.
     pub fn handle_device_lost(&self, context: &WgpuContext) {
-        self.0.lock().clear(|textures| {
-            textures.device = context.device.clone();
-            textures.queue = context.queue.clone();
-            textures.color_texture_format = context.color_texture_format();
-            textures.storage = WgpuAtlasStorage::default();
-            textures.pending_uploads.clear();
-        });
+        let mut window = self.0.lock();
+        window.release_images();
+        *window = WindowAtlas::join(DeviceAtlas::shared(
+            &context.device,
+            &context.queue,
+            context.color_texture_format(),
+        ));
+    }
+}
+
+impl Drop for WgpuAtlas {
+    fn drop(&mut self) {
+        self.0.get_mut().release_images();
     }
 }
 
@@ -116,11 +285,44 @@ impl PlatformAtlas for WgpuAtlas {
         key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
-        self.0.lock().get_or_insert_with(key, build)
+        let mut window = self.0.lock();
+        let WindowAtlas {
+            shared,
+            images,
+            images_epoch,
+            ..
+        } = &mut *window;
+        let mut state = shared.state.lock();
+        if !matches!(key, AtlasKey::Image(_)) {
+            return state.tiles.get_or_insert_with(key, build);
+        }
+
+        if *images_epoch != state.epoch {
+            images.clear();
+            *images_epoch = state.epoch;
+        }
+        let tile = state.tiles.get_or_insert_with(key.clone(), build)?;
+        if tile.is_some() && !images.contains(&key) {
+            *state.image_holders.entry(key.clone()).or_default() += 1;
+            images.insert(key);
+        }
+        Ok(tile)
     }
 
+    /// Releases this window's hold on an image. Glyphs and SVGs are shared
+    /// by every window and kept for the atlas's life.
     fn remove(&self, key: &AtlasKey) {
-        self.0.lock().remove(key);
+        let mut window = self.0.lock();
+        let WindowAtlas {
+            shared,
+            images,
+            images_epoch,
+            ..
+        } = &mut *window;
+        let mut state = shared.state.lock();
+        if *images_epoch == state.epoch && images.remove(key) {
+            state.release_image(key);
+        }
     }
 }
 
@@ -564,5 +766,165 @@ mod tests {
             swizzle_upload_data(&input, wgpu::TextureFormat::Rgba8Unorm),
             vec![0x30, 0x20, 0x10, 0x40, 0xCC, 0xBB, 0xAA, 0xDD]
         );
+    }
+
+    fn image_key(image_id: usize) -> AtlasKey {
+        AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(image_id),
+            frame_index: 0,
+        })
+    }
+
+    fn pixel() -> Result<Option<(Size<DevicePixels>, Cow<'static, [u8]>)>> {
+        let size = Size {
+            width: DevicePixels(1),
+            height: DevicePixels(1),
+        };
+        Ok(Some((size, Cow::Owned(vec![0, 0, 0, 255]))))
+    }
+
+    fn pending_uploads(atlas: &WgpuAtlas) -> usize {
+        let window = atlas.0.lock();
+        let state = window.shared.state.lock();
+        state.tiles.backend.pending_uploads.len()
+    }
+
+    #[test]
+    fn windows_on_one_device_share_tiles() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let a = WgpuAtlas::new(
+            device.clone(),
+            queue.clone(),
+            wgpu::TextureFormat::Bgra8Unorm,
+        );
+        let b = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let key = image_key(1);
+
+        let mut builds = 0;
+        let tile_a = a
+            .get_or_insert_with(key.clone(), &mut || {
+                builds += 1;
+                pixel()
+            })?
+            .expect("tile");
+        let tile_b = b
+            .get_or_insert_with(key, &mut || {
+                builds += 1;
+                pixel()
+            })?
+            .expect("tile");
+        assert_eq!(builds, 1);
+        assert_eq!(tile_a, tile_b);
+
+        // The upload is queued once, and the other window's frame writes it.
+        assert_eq!(pending_uploads(&a), 1);
+        b.before_frame();
+        assert_eq!(pending_uploads(&a), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn image_tile_lives_until_its_last_holder_removes_it() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let a = WgpuAtlas::new(
+            device.clone(),
+            queue.clone(),
+            wgpu::TextureFormat::Bgra8Unorm,
+        );
+        let b = WgpuAtlas::new(
+            device.clone(),
+            queue.clone(),
+            wgpu::TextureFormat::Bgra8Unorm,
+        );
+        let c = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let key = image_key(1);
+
+        let tile = a
+            .get_or_insert_with(key.clone(), &mut pixel)?
+            .expect("tile");
+        b.get_or_insert_with(key.clone(), &mut pixel)?;
+
+        // A window that never held it cannot free it.
+        c.remove(&key);
+        a.remove(&key);
+        a.remove(&key);
+        assert!(b.get_texture_info(tile.texture_id).is_some());
+
+        b.remove(&key);
+        assert!(b.get_texture_info(tile.texture_id).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn closing_window_releases_its_images() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let a = WgpuAtlas::new(
+            device.clone(),
+            queue.clone(),
+            wgpu::TextureFormat::Bgra8Unorm,
+        );
+        let b = WgpuAtlas::new(
+            device.clone(),
+            queue.clone(),
+            wgpu::TextureFormat::Bgra8Unorm,
+        );
+        let bystander = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let key = image_key(1);
+
+        let tile = a
+            .get_or_insert_with(key.clone(), &mut pixel)?
+            .expect("tile");
+        b.get_or_insert_with(key, &mut pixel)?;
+        drop(b);
+        assert!(bystander.get_texture_info(tile.texture_id).is_some());
+        drop(a);
+        assert!(bystander.get_texture_info(tile.texture_id).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn clear_is_seen_by_every_window_and_forgets_old_holds() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let a = WgpuAtlas::new(
+            device.clone(),
+            queue.clone(),
+            wgpu::TextureFormat::Bgra8Unorm,
+        );
+        let b = WgpuAtlas::new(
+            device.clone(),
+            queue.clone(),
+            wgpu::TextureFormat::Bgra8Unorm,
+        );
+        let c = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let key = image_key(1);
+
+        a.get_or_insert_with(key.clone(), &mut pixel)?;
+        b.get_or_insert_with(key.clone(), &mut pixel)?;
+        a.clear();
+        assert!(!a.take_cleared());
+        assert!(b.take_cleared());
+        assert!(!b.take_cleared());
+
+        // b's hold is from before the clear: removing it must not free c's.
+        let tile = c
+            .get_or_insert_with(key.clone(), &mut pixel)?
+            .expect("tile");
+        b.remove(&key);
+        drop(b);
+        assert!(c.get_texture_info(tile.texture_id).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn separate_devices_have_separate_atlases() -> anyhow::Result<()> {
+        let (device_a, queue_a) = test_device_and_queue()?;
+        let (device_b, queue_b) = test_device_and_queue()?;
+        let a = WgpuAtlas::new(device_a, queue_a, wgpu::TextureFormat::Bgra8Unorm);
+        let b = WgpuAtlas::new(device_b, queue_b, wgpu::TextureFormat::Bgra8Unorm);
+        let tile = a
+            .get_or_insert_with(image_key(1), &mut pixel)?
+            .expect("tile");
+        assert!(b.get_texture_info(tile.texture_id).is_none());
+        Ok(())
     }
 }

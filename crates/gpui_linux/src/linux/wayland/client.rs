@@ -405,6 +405,10 @@ pub(crate) struct WaylandClientState {
     button_pressed: Option<MouseButton>,
     mouse_focused_window: Option<WaylandWindowStatePtr>,
     keyboard_focused_window: Option<WaylandWindowStatePtr>,
+    /// myshell: the surface `wl_keyboard.enter` named, so a grab popup we
+    /// destroy while it has the keyboard can be left as the compositor
+    /// would have (`WaylandClientStatePtr::keyboard_surface_destroyed`).
+    keyboard_focused_surface: Option<ObjectId>,
     loop_handle: LoopHandle<'static, ()>,
     cursor_style: Option<CursorStyle>,
     cursor_hidden_window: Option<WaylandWindowStatePtr>,
@@ -577,6 +581,43 @@ impl WaylandClientState {
 pub struct WaylandClientStatePtr(Weak<RefCell<WaylandClientState>>);
 
 impl WaylandClientStatePtr {
+    /// myshell: `surface` (a grab popup) is being destroyed by us. If it has
+    /// the keyboard, the compositor can no longer say `leave` for it, nor
+    /// send the release of a key held on it (the sheet hides, and its popup
+    /// goes, on Escape's press): leave it here as `wl_keyboard.leave` does.
+    /// Without this, the held key repeated until the next key event, into
+    /// whatever got the keyboard next: a launcher opened then closed on the
+    /// repeated Escape, and the bar, its last input now the keyboard, took
+    /// no click (gpui's hitboxes are not hovered after keyboard input).
+    pub(crate) fn keyboard_surface_destroyed(&self, surface: &ObjectId) {
+        let Some(client) = self.0.upgrade() else {
+            return;
+        };
+        // Within the client's own dispatch the compositor's events still
+        // reach it; only our own teardown needs this.
+        let Ok(mut state) = client.try_borrow_mut() else {
+            return;
+        };
+        if state.keyboard_focused_surface.as_ref() != Some(surface) {
+            return;
+        }
+        state.keyboard_focused_surface = None;
+        let window = state.keyboard_focused_window.take();
+        state.enter_token.take();
+        state.repeat.current_id += 1;
+        if let Some(window) = window {
+            if let Some(ref mut compose) = state.compose_state {
+                compose.reset();
+            }
+            state.pre_edit_text.take();
+            // Not now: the caller may hold the window's state.
+            state.loop_handle.insert_idle(move |_| {
+                window.handle_ime(ImeInput::DeleteText);
+                window.set_focused(false);
+            });
+        }
+    }
+
     pub fn get_client(&self) -> Rc<RefCell<WaylandClientState>> {
         self.0
             .upgrade()
@@ -1127,6 +1168,7 @@ impl WaylandConnection {
             button_pressed: None,
             mouse_focused_window: None,
             keyboard_focused_window: None,
+            keyboard_focused_surface: None,
             loop_handle: handle.clone(),
             enter_token: None,
             cursor_style: None,
@@ -1742,7 +1784,12 @@ pub(crate) fn get_window(
     state: &mut RefMut<WaylandClientState>,
     surface_id: &ObjectId,
 ) -> Option<WaylandWindowStatePtr> {
-    state.windows.get(surface_id).cloned()
+    state
+        .windows
+        .get(surface_id)
+        .cloned()
+        // myshell: a grab popup stands for its layer window.
+        .or_else(|| super::myshell::grab_parent(surface_id))
 }
 
 impl Dispatch<wl_surface::WlSurface, ()> for WaylandClientStatePtr {
@@ -2096,6 +2143,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             }
             wl_keyboard::Event::Enter { surface, .. } => {
                 state.keyboard_focused_window = get_window(&mut state, &surface.id());
+                state.keyboard_focused_surface = Some(surface.id());
                 state.enter_token = Some(());
 
                 if let Some(window) = state.keyboard_focused_window.clone() {
@@ -2106,6 +2154,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             wl_keyboard::Event::Leave { surface, .. } => {
                 let keyboard_focused_window = get_window(&mut state, &surface.id());
                 state.keyboard_focused_window = None;
+                state.keyboard_focused_surface = None;
                 state.enter_token.take();
                 // Prevent keyboard events from repeating after opening e.g. a file chooser and closing it quickly
                 state.repeat.current_id += 1;
@@ -2174,6 +2223,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 let Some(focused_window) = focused_window else {
                     return;
                 };
+                // myshell: for latency work (MYSHELL_FRAMES=causes), when a
+                // key press reaches the client.
+                if key_state == wl_keyboard::KeyState::Pressed {
+                    super::myshell::trace_frame("key", focused_window.handle().window_id());
+                }
 
                 let keymap_state = state.keymap_state.as_ref().unwrap();
                 let keycode = Keycode::from(key + MIN_KEYCODE);
