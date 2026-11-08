@@ -41,7 +41,7 @@ use gpui::{
     PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
     WindowKind, WindowParams, WindowVisibility,
-    layer_shell::{Anchor, LayerShellNotSupportedError},
+    layer_shell::{Anchor, LayerShellNotSupportedError, LayerShellOptions},
     popup::PopupOptions,
     px, size,
 };
@@ -143,6 +143,12 @@ pub struct WaylandWindowState {
     client_inset: Option<Pixels>,
     client_corner_radii: Corners<Pixels>,
     accesskit_adapter: Option<accesskit_unix::Adapter>,
+    /// A layer-shell window hidden with `hide`, or opened with `show: false`. Its surface is
+    /// unmapped and it draws nothing, but it keeps its renderer.
+    hidden: bool,
+    /// Whether a hidden window has acked the configure for its next map, so that showing it
+    /// can present at once.
+    configured_while_hidden: bool,
 }
 
 pub enum WaylandSurfaceState {
@@ -177,34 +183,18 @@ impl WaylandSurfaceState {
 
             let width = f32::from(params.bounds.size.width);
             let height = f32::from(params.bounds.size.height);
-            layer_surface.set_size(width as u32, height as u32);
-
-            layer_surface.set_anchor(super::layer_shell::wayland_anchor(options.anchor));
-            layer_surface.set_keyboard_interactivity(
-                super::layer_shell::wayland_keyboard_interactivity(options.keyboard_interactivity),
-            );
-
-            if let Some(margin) = options.margin {
-                layer_surface.set_margin(
-                    f32::from(margin.0) as i32,
-                    f32::from(margin.1) as i32,
-                    f32::from(margin.2) as i32,
-                    f32::from(margin.3) as i32,
-                )
-            }
-
-            if let Some(exclusive_zone) = options.exclusive_zone {
-                layer_surface.set_exclusive_zone(f32::from(exclusive_zone) as i32);
-            }
-
-            if let Some(exclusive_edge) = options.exclusive_edge {
-                Self::apply_exclusive_edge(&layer_surface, options.anchor, exclusive_edge);
-            }
-
-            return Ok(WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState {
+            let layer_surface_state = WaylandLayerSurfaceState {
                 layer_surface,
                 anchor: options.anchor,
-            }));
+                options: options.clone(),
+                size: Cell::new((width as u32, height as u32)),
+                exclusive_zone: Cell::new(
+                    options.exclusive_zone.map(|zone| f32::from(zone) as i32),
+                ),
+                exclusive_edge: Cell::new(options.exclusive_edge),
+            };
+            layer_surface_state.send_state();
+            return Ok(WaylandSurfaceState::LayerShell(layer_surface_state));
         }
 
         if let WindowKind::AnchoredPopup(options) = &params.kind {
@@ -314,6 +304,41 @@ pub struct WaylandXdgSurfaceState {
 pub struct WaylandLayerSurfaceState {
     layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
     anchor: Anchor,
+    // Unmapping a layer surface resets it to its state when it was created, so what it was set
+    // up with is kept to send again when it is mapped.
+    options: LayerShellOptions,
+    size: Cell<(u32, u32)>,
+    exclusive_zone: Cell<Option<i32>>,
+    exclusive_edge: Cell<Option<Anchor>>,
+}
+
+impl WaylandLayerSurfaceState {
+    fn send_state(&self) {
+        let layer_surface = &self.layer_surface;
+        if layer_surface.version() >= zwlr_layer_surface_v1::REQ_SET_LAYER_SINCE {
+            layer_surface.set_layer(super::layer_shell::wayland_layer(self.options.layer));
+        }
+        let (width, height) = self.size.get();
+        layer_surface.set_size(width, height);
+        layer_surface.set_anchor(super::layer_shell::wayland_anchor(self.options.anchor));
+        layer_surface.set_keyboard_interactivity(
+            super::layer_shell::wayland_keyboard_interactivity(self.options.keyboard_interactivity),
+        );
+        if let Some(margin) = self.options.margin {
+            layer_surface.set_margin(
+                f32::from(margin.0) as i32,
+                f32::from(margin.1) as i32,
+                f32::from(margin.2) as i32,
+                f32::from(margin.3) as i32,
+            )
+        }
+        if let Some(zone) = self.exclusive_zone.get() {
+            layer_surface.set_exclusive_zone(zone);
+        }
+        if let Some(edge) = self.exclusive_edge.get() {
+            WaylandSurfaceState::apply_exclusive_edge(layer_surface, self.anchor, edge);
+        }
+    }
 }
 
 pub struct WaylandPopupSurfaceState {
@@ -433,9 +458,14 @@ impl WaylandSurfaceState {
             WaylandSurfaceState::Xdg(WaylandXdgSurfaceState { xdg_surface, .. }) => {
                 xdg_surface.set_window_geometry(x, y, width, height);
             }
-            WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState { layer_surface, .. }) => {
+            WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState {
+                layer_surface,
+                size,
+                ..
+            }) => {
                 // cannot set window position of a layer surface
                 layer_surface.set_size(width as u32, height as u32);
+                size.set((width as u32, height as u32));
             }
             WaylandSurfaceState::Popup(WaylandPopupSurfaceState { xdg_surface, .. }) => {
                 xdg_surface.set_window_geometry(x, y, width, height);
@@ -469,10 +499,14 @@ impl WaylandSurfaceState {
     }
 
     fn set_exclusive_zone(&self, zone: i32) -> bool {
-        if let WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState { layer_surface, .. }) =
-            self
+        if let WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState {
+            layer_surface,
+            exclusive_zone,
+            ..
+        }) = self
         {
             layer_surface.set_exclusive_zone(zone);
+            exclusive_zone.set(Some(zone));
             true
         } else {
             false
@@ -502,10 +536,15 @@ impl WaylandSurfaceState {
         if let WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState {
             layer_surface,
             anchor,
+            exclusive_edge,
             ..
         }) = self
         {
-            Self::apply_exclusive_edge(layer_surface, *anchor, edge)
+            let applied = Self::apply_exclusive_edge(layer_surface, *anchor, edge);
+            if applied {
+                exclusive_edge.set(Some(edge));
+            }
+            applied
         } else {
             false
         }
@@ -645,6 +684,8 @@ impl WaylandWindowState {
             client_inset: None,
             client_corner_radii: Corners::default(),
             accesskit_adapter: None,
+            hidden: false,
+            configured_while_hidden: false,
         })
     }
 
@@ -838,6 +879,54 @@ impl WaylandWindow {
         self.0.state.borrow_mut()
     }
 
+    // Unmaps the layer surface with a null buffer, then makes the initial commit of its next
+    // map straight away, so that its configure is acked while it is hidden and showing it
+    // needs no round trip. Nothing is drawn while hidden: the frame loop is `Unconfigured`,
+    // which every wakeup ignores.
+    fn hide_layer_surface(&self) {
+        let mut state = self.borrow_mut();
+        if state.hidden {
+            return;
+        }
+        state.hidden = true;
+        state.configured_while_hidden = false;
+        state.visibility = WindowVisibility::Hidden;
+        state.pending_frame_callback = None;
+        state.presentation = PresentationState::Unpresented;
+        state.in_progress_configure = None;
+        self.0.frame_loop.set(FrameLoop::Unconfigured);
+        state.surface.attach(None, 0, 0);
+        state.surface.commit();
+        if let WaylandSurfaceState::LayerShell(layer_surface_state) = &state.surface_state {
+            layer_surface_state.send_state();
+        }
+        state.surface.commit();
+        drop(state);
+        self.0.report_visibility_soon();
+    }
+
+    // With its configure acked, the next frame presents the window's current scene; otherwise
+    // the configure on its way draws it, as a new window's first configure does.
+    fn show_layer_surface(&self) {
+        let mut state = self.borrow_mut();
+        if !state.hidden {
+            return;
+        }
+        state.hidden = false;
+        state.visibility = WindowVisibility::Visible;
+        let configured = std::mem::take(&mut state.configured_while_hidden);
+        if configured {
+            state.redraw_requested = true;
+            state.presentation = PresentationState::RetryBeforeFirstPresent;
+        }
+        drop(state);
+        if configured {
+            self.0.frame_loop.set(FrameLoop::Parked);
+            self.0.schedule_frame();
+        }
+        self.0.report_visibility_soon();
+    }
+
     pub fn new(
         handle: AnyWindowHandle,
         globals: Globals,
@@ -870,6 +959,9 @@ impl WaylandWindow {
             .map(|viewporter| viewporter.get_viewport(&surface, &globals.qh, ()));
 
         let frame_ping = globals.frame_ping.clone();
+        // A layer surface opened hidden takes its first configure, but stays unmapped until it
+        // is shown.
+        let hidden = !params.show && matches!(params.kind, WindowKind::LayerShell(_));
         let this = Self(WaylandWindowStatePtr {
             state: Rc::new(RefCell::new(WaylandWindowState::new(
                 handle,
@@ -889,6 +981,11 @@ impl WaylandWindow {
             frame_ping,
             scheduled_frame_at: Rc::new(Cell::new(None)),
         });
+        if hidden {
+            let mut state = this.borrow_mut();
+            state.hidden = true;
+            state.visibility = WindowVisibility::Hidden;
+        }
 
         // Kick things off
         surface.commit();
@@ -1172,7 +1269,12 @@ impl WaylandWindowStatePtr {
             );
 
             let initial_configure = self.frame_loop.get() == FrameLoop::Unconfigured;
+            let hidden = state.hidden;
             update_window(state);
+            if hidden {
+                self.state.borrow_mut().configured_while_hidden = true;
+                return;
+            }
             if initial_configure {
                 self.frame(None, FrameRequestSource::NativeCallback);
             } else {
@@ -1351,12 +1453,17 @@ impl WaylandWindowStatePtr {
                 };
 
                 let mut state = self.state.borrow_mut();
+                let visibility = if state.hidden {
+                    WindowVisibility::Hidden
+                } else {
+                    WindowVisibility::Visible
+                };
                 state.in_progress_configure = Some(InProgressConfigure {
                     size,
                     fullscreen: false,
                     maximized: false,
                     resizing: false,
-                    visibility: WindowVisibility::Visible,
+                    visibility,
                     tiling: Tiling::default(),
                 });
                 drop(state);
@@ -1647,6 +1754,20 @@ impl WaylandWindowStatePtr {
         {
             *display = output.clone();
         }
+    }
+
+    // Hiding and showing happen inside the window's own update, where its callbacks can't run.
+    fn report_visibility_soon(&self) {
+        let this = self.clone();
+        self.state
+            .borrow()
+            .globals
+            .executor
+            .spawn(async move {
+                let visibility = this.state.borrow().visibility;
+                this.report_visibility(visibility);
+            })
+            .detach();
     }
 
     fn report_visibility(&self, visibility: WindowVisibility) {
@@ -2141,6 +2262,18 @@ impl PlatformWindow for WaylandWindow {
             // Commit to apply it immediately, otherwise it only takes effect
             // on the next frame.
             state.surface.commit();
+        }
+    }
+
+    fn hide(&self) {
+        if self.borrow().surface_state.layer_surface().is_some() {
+            self.hide_layer_surface();
+        }
+    }
+
+    fn show(&self) {
+        if self.borrow().surface_state.layer_surface().is_some() {
+            self.show_layer_surface();
         }
     }
 

@@ -1387,6 +1387,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     #[cfg(all(target_os = "linux", feature = "wayland"))]
     fn set_exclusive_edge(&self, _edge: layer_shell::Anchor) {}
     fn set_input_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
+    fn hide(&self) {}
+    fn show(&self) {}
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
     }
