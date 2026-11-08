@@ -6928,6 +6928,21 @@ impl Window {
         self.platform_window.minimize();
     }
 
+    /// Hide the window without closing it. It keeps its state and GPU resources and draws
+    /// nothing until [`Self::show_window`] shows it again, which is much cheaper than opening a
+    /// new window for windows that come and go often, such as a panel's popovers.
+    /// (Wayland layer-shell windows only)
+    pub fn hide_window(&self) {
+        self.platform_window.hide();
+    }
+
+    /// Show a window hidden with [`Self::hide_window`], or opened with
+    /// [`WindowOptions::show`](crate::WindowOptions::show) set to false. It presents its
+    /// current content on the next frame. (Wayland layer-shell windows only)
+    pub fn show_window(&self) {
+        self.platform_window.show();
+    }
+
     /// Toggle full screen status on the current window at the platform level.
     pub fn toggle_fullscreen(&self) {
         self.platform_window.toggle_fullscreen();
