@@ -811,10 +811,21 @@ impl WaylandClientStatePtr {
         {
             state.mouse_focused_window = Some(window);
         }
-        if let Some(window) = state.keyboard_focused_window.take()
-            && !window.ptr_eq(&closed_window)
-        {
-            state.keyboard_focused_window = Some(window);
+        if let Some(window) = state.keyboard_focused_window.take() {
+            if window.ptr_eq(&closed_window) {
+                // Compositors need not send `wl_keyboard.leave` for a surface the client
+                // destroyed, nor the release of a key held on it. Without leaving here, a key
+                // that closed the window (Escape on a popup) keeps repeating into whichever of
+                // our windows gets the keyboard next.
+                state.enter_token.take();
+                state.repeat.current_id += 1;
+                if let Some(compose) = state.compose_state.as_mut() {
+                    compose.reset();
+                }
+                state.pre_edit_text.take();
+            } else {
+                state.keyboard_focused_window = Some(window);
+            }
         }
         if let Some(window) = state.cursor_hidden_window.take()
             && !window.ptr_eq(&closed_window)
