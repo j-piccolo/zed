@@ -460,7 +460,14 @@ impl WgpuContext {
                 label: Some("gpui_device"),
                 required_features,
                 required_limits,
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                // `MemoryUsage` suballocates from blocks of 8 to 64 MB, and the allocator keeps
+                // a memory type's last block when it empties and grows each new one, so a few
+                // MB of buffers could hold tens of MB of device memory. Anything larger than a
+                // block, such as a window-sized texture, gets memory of its own and gives it
+                // back when it is dropped.
+                memory_hints: wgpu::MemoryHints::Manual {
+                    suballocated_device_memory_block_size: (4 << 20)..(4 << 20),
+                },
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 default_queue: wgpu::QueueDescriptor::default(),
