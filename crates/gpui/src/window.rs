@@ -2724,6 +2724,22 @@ impl Window {
         }
     }
 
+    /// Show only part of a layer-shell window: the top-left `crop.size` of it, as a layer
+    /// surface that size placed at `crop.origin`, relative to the top-left corner of its
+    /// output. The compositor sees a surface just that size, so input, blur and what it
+    /// composites cover only that part, while the window keeps its own size and swapchain, so
+    /// the crop can move and resize from frame to frame without reallocating them. An empty
+    /// crop shows nothing that takes input or blur, and `None` gives back the whole window.
+    ///
+    /// The crop goes out with the window's next frame, so that a frame drawn for a crop
+    /// reaches the screen with it. It replaces the surface's anchor, margin and input region,
+    /// so the window should not reserve an exclusive zone. Without `wp_viewporter` support the
+    /// whole window is still drawn, and only the crop takes input. (Wayland layer-shell
+    /// windows only)
+    pub fn set_layer_surface_crop(&self, crop: Option<Bounds<Pixels>>) {
+        self.platform_window.set_layer_surface_crop(crop);
+    }
+
     /// Linux (wayland) only: Set the window's input region, the area that receives pointer
     /// and touch input. Events outside it pass through to whatever is below the window.
     ///

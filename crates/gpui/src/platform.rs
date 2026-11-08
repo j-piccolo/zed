@@ -1390,6 +1390,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn hide(&self) {}
     fn show(&self) {}
     fn set_keep_swapchain_when_hidden(&self, _keep: bool) {}
+    fn set_layer_surface_crop(&self, _crop: Option<Bounds<Pixels>>) {}
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
     }
