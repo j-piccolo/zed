@@ -6968,6 +6968,25 @@ impl Window {
         self.platform_window.set_keep_swapchain_when_hidden(keep);
     }
 
+    /// Take an input grab for a layer-shell window, like the one a grabbing popup holds: the
+    /// window gets keyboard focus, and the grab ends when the user presses on another
+    /// application's surface, which still receives that press. `on_end` runs when the
+    /// compositor ends the grab, but not when hiding or closing the window ends it.
+    ///
+    /// The grab starts once the window is on screen, replacing any grab it holds. As with
+    /// grabbing popups, it must be requested while the input that triggers it is still
+    /// active, in practice the press of a mouse button. (Wayland layer-shell windows only)
+    pub fn request_popup_grab(
+        &self,
+        cx: &App,
+        on_end: impl FnOnce(&mut Window, &mut App) + 'static,
+    ) {
+        let mut cx = self.to_async(cx);
+        self.platform_window.request_popup_grab(Box::new(move || {
+            cx.update(|window, cx| on_end(window, cx)).log_err();
+        }));
+    }
+
     /// Toggle full screen status on the current window at the platform level.
     pub fn toggle_fullscreen(&self) {
         self.platform_window.toggle_fullscreen();

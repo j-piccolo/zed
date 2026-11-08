@@ -1391,6 +1391,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn show(&self) {}
     fn set_keep_swapchain_when_hidden(&self, _keep: bool) {}
     fn set_layer_surface_crop(&self, _crop: Option<Bounds<Pixels>>) {}
+    fn request_popup_grab(&self, _on_end: Box<dyn FnOnce()>) {}
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
     }

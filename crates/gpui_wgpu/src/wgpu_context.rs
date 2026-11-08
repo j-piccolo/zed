@@ -1,5 +1,5 @@
-use crate::wgpu_renderer::PipelineCache;
 use crate::wgpu_atlas::SharedAtlas;
+use crate::wgpu_renderer::PipelineCache;
 #[cfg(not(target_family = "wasm"))]
 use crate::{WgpuRenderer, WgpuSurfaceConfig};
 #[cfg(not(target_family = "wasm"))]

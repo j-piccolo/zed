@@ -32,7 +32,7 @@ use wayland_protocols::{
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
-use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
+use crate::linux::wayland::{display::WaylandDisplay, popup_grab::PopupGrab, serial::SerialKind};
 use crate::linux::{Globals, Output, PendingActivation, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Corners, Decorations, DevicePixels, ExternalDragPayload,
@@ -155,6 +155,10 @@ pub struct WaylandWindowState {
     layer_crop: Option<Bounds<i32>>,
     /// A crop asked for since the last frame, applied with the next.
     pending_layer_crop: Option<Option<Bounds<i32>>>,
+    /// A popup grab asked for, which starts once the window is on screen: a grab's root
+    /// surface must be mapped.
+    requested_popup_grab: Option<Box<dyn FnOnce()>>,
+    popup_grab: Option<PopupGrab>,
 }
 
 pub enum WaylandSurfaceState {
@@ -702,7 +706,16 @@ impl WaylandWindowState {
             keep_swapchain_when_hidden: false,
             layer_crop: None,
             pending_layer_crop: None,
+            requested_popup_grab: None,
+            popup_grab: None,
         })
+    }
+
+    fn end_popup_grab(&mut self) {
+        self.requested_popup_grab = None;
+        if let Some(grab) = self.popup_grab.take() {
+            grab.destroy(&self.client);
+        }
     }
 
     pub fn is_transparent(&self) -> bool {
@@ -836,6 +849,9 @@ impl Drop for WaylandWindow {
         let mut state = self.0.state.borrow_mut();
         let surface_id = state.surface.id();
 
+        // A grab's popup must be destroyed before the layer surface it is a child of.
+        state.end_popup_grab();
+
         if let Some(parent) = state.parent.as_ref() {
             parent.state.borrow_mut().children.remove(&surface_id);
         }
@@ -907,6 +923,8 @@ impl WaylandWindow {
         state.hidden = true;
         state.configured_while_hidden = false;
         state.visibility = WindowVisibility::Hidden;
+        // A grab's root surface must be mapped.
+        state.end_popup_grab();
         state.pending_frame_callback = None;
         state.presentation = PresentationState::Unpresented;
         state.in_progress_configure = None;
@@ -1144,8 +1162,59 @@ impl WaylandWindowStatePtr {
         // Another wl_surface commit may have carried this callback while a retry
         // timer owned the render-loop wakeup.
         self.state.borrow_mut().pending_frame_callback = None;
+        // By its first frame callback, a shown layer surface has been mapped.
+        self.start_requested_popup_grab();
         if self.frame_loop.get() == FrameLoop::AwaitingCallback {
             self.frame(signal_at, FrameRequestSource::NativeCallback);
+        }
+    }
+
+    fn start_requested_popup_grab(&self) {
+        let mut state = self.state.borrow_mut();
+        if state.hidden || state.presentation != PresentationState::Presented {
+            return;
+        }
+        let Some(layer_surface) = state.surface_state.layer_surface().cloned() else {
+            return;
+        };
+        let Some(on_end) = state.requested_popup_grab.take() else {
+            return;
+        };
+        if let Some(grab) = state.popup_grab.take() {
+            grab.destroy(&state.client);
+        }
+        let serial = state.client.get_serial(SerialKind::MousePress).as_raw();
+        let grab = PopupGrab::start(
+            &state.globals,
+            &layer_surface,
+            state.surface.id(),
+            serial,
+            on_end,
+        );
+        state
+            .client
+            .popup_grab_started(grab.surface_id(), self.clone());
+        state.popup_grab = Some(grab);
+    }
+
+    pub(crate) fn with_popup_grab(&self, f: impl FnOnce(&PopupGrab)) {
+        if let Some(grab) = self.state.borrow().popup_grab.as_ref() {
+            f(grab);
+        }
+    }
+
+    /// The compositor ended the grab held by `popup`.
+    pub(crate) fn popup_grab_done(&self, popup: &xdg_popup::XdgPopup) {
+        let mut state = self.state.borrow_mut();
+        let Some(mut grab) = state.popup_grab.take_if(|grab| grab.holds(popup)) else {
+            return;
+        };
+        let client = state.client.clone();
+        drop(state);
+        let on_end = grab.take_on_end();
+        grab.destroy(&client);
+        if let Some(on_end) = on_end {
+            on_end();
         }
     }
 
@@ -2336,6 +2405,16 @@ impl PlatformWindow for WaylandWindow {
             state.pending_layer_crop =
                 Some(crop.map(|crop| crop.map(|value| f32::from(value).round() as i32)));
         }
+    }
+
+    fn request_popup_grab(&self, on_end: Box<dyn FnOnce()>) {
+        let mut state = self.borrow_mut();
+        if state.surface_state.layer_surface().is_none() {
+            return;
+        }
+        state.requested_popup_grab = Some(on_end);
+        drop(state);
+        self.0.start_requested_popup_grab();
     }
 
     fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
