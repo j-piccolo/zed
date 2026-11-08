@@ -149,6 +149,11 @@ pub struct WaylandWindowState {
     /// Whether a hidden window has acked the configure for its next map, so that showing it
     /// can present at once.
     configured_while_hidden: bool,
+    /// The part of a layer-shell window shown (`set_layer_surface_crop`): its top-left
+    /// `size`, as a surface that size at `origin` on the output.
+    layer_crop: Option<Bounds<i32>>,
+    /// A crop asked for since the last frame, applied with the next.
+    pending_layer_crop: Option<Option<Bounds<i32>>>,
 }
 
 pub enum WaylandSurfaceState {
@@ -453,6 +458,13 @@ impl WaylandSurfaceState {
         }
     }
 
+    // The size a cropped layer surface asks for once it is uncropped, without asking for it now.
+    fn remember_layer_size(&self, width: i32, height: i32) {
+        if let WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState { size, .. }) = self {
+            size.set((width as u32, height as u32));
+        }
+    }
+
     fn set_geometry(&self, x: i32, y: i32, width: i32, height: i32) {
         match self {
             WaylandSurfaceState::Xdg(WaylandXdgSurfaceState { xdg_surface, .. }) => {
@@ -686,6 +698,8 @@ impl WaylandWindowState {
             accesskit_adapter: None,
             hidden: false,
             configured_while_hidden: false,
+            layer_crop: None,
+            pending_layer_crop: None,
         })
     }
 
@@ -897,9 +911,9 @@ impl WaylandWindow {
         self.0.frame_loop.set(FrameLoop::Unconfigured);
         state.surface.attach(None, 0, 0);
         state.surface.commit();
-        if let WaylandSurfaceState::LayerShell(layer_surface_state) = &state.surface_state {
-            layer_surface_state.send_state();
-        }
+        // The surface as it was opened. A crop is set again by the frame that shows it.
+        state.layer_crop = None;
+        apply_layer_crop(&state);
         state.surface.commit();
         drop(state);
         self.0.report_visibility_soon();
@@ -1261,12 +1275,18 @@ impl WaylandWindowStatePtr {
             .map(|v| f32::from(v) as i32)
             .map_size(|v| if v <= 0 { 1 } else { v });
 
-            state.surface_state.set_geometry(
-                window_geometry.origin.x,
-                window_geometry.origin.y,
-                window_geometry.size.width,
-                window_geometry.size.height,
-            );
+            if state.layer_crop.is_some() {
+                state
+                    .surface_state
+                    .remember_layer_size(window_geometry.size.width, window_geometry.size.height);
+            } else {
+                state.surface_state.set_geometry(
+                    window_geometry.origin.x,
+                    window_geometry.origin.y,
+                    window_geometry.size.width,
+                    window_geometry.size.height,
+                );
+            }
 
             let initial_configure = self.frame_loop.get() == FrameLoop::Unconfigured;
             let hidden = state.hidden;
@@ -1446,13 +1466,13 @@ impl WaylandWindowStatePtr {
                 height,
                 serial,
             } => {
-                let size = if width == 0 || height == 0 {
+                let mut state = self.state.borrow_mut();
+                // A cropped surface was given the crop's size; the window keeps its own.
+                let size = if width == 0 || height == 0 || state.layer_crop.is_some() {
                     None
                 } else {
                     Some(size(px(width as f32), px(height as f32)))
                 };
-
-                let mut state = self.state.borrow_mut();
                 let visibility = if state.hidden {
                     WindowVisibility::Hidden
                 } else {
@@ -1649,7 +1669,10 @@ impl WaylandWindowStatePtr {
         }
 
         let state = self.state.borrow_mut();
-        if let Some(viewport) = &state.viewport {
+        // A crop's source is in buffer pixels, which may have changed with the scale.
+        if state.layer_crop.is_some() {
+            apply_layer_crop(&state);
+        } else if let Some(viewport) = &state.viewport {
             viewport.set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
         }
         update_window(state);
@@ -1912,12 +1935,18 @@ impl PlatformWindow for WaylandWindow {
         .map(|v| f32::from(v) as i32)
         .map_size(|v| if v <= 0 { 1 } else { v });
 
-        state.surface_state.set_geometry(
-            window_geometry.origin.x,
-            window_geometry.origin.y,
-            window_geometry.size.width,
-            window_geometry.size.height,
-        );
+        if state.layer_crop.is_some() {
+            state
+                .surface_state
+                .remember_layer_size(window_geometry.size.width, window_geometry.size.height);
+        } else {
+            state.surface_state.set_geometry(
+                window_geometry.origin.x,
+                window_geometry.origin.y,
+                window_geometry.size.width,
+                window_geometry.size.height,
+            );
+        }
 
         state
             .globals
@@ -2145,6 +2174,13 @@ impl PlatformWindow for WaylandWindow {
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
         let state = &mut *state;
+        // A crop asked for while drawing this frame is committed with it.
+        if let Some(crop) = state.pending_layer_crop.take()
+            && crop != state.layer_crop
+        {
+            state.layer_crop = crop;
+            apply_layer_crop(state);
+        }
         let Some(renderer) = &mut state.renderer else {
             return;
         };
@@ -2274,6 +2310,14 @@ impl PlatformWindow for WaylandWindow {
     fn show(&self) {
         if self.borrow().surface_state.layer_surface().is_some() {
             self.show_layer_surface();
+        }
+    }
+
+    fn set_layer_surface_crop(&self, crop: Option<Bounds<Pixels>>) {
+        let mut state = self.borrow_mut();
+        if state.surface_state.layer_surface().is_some() {
+            state.pending_layer_crop =
+                Some(crop.map(|crop| crop.map(|value| f32::from(value).round() as i32)));
         }
     }
 
@@ -2569,6 +2613,102 @@ mod rounded_rect_tests {
     }
 }
 
+// Shows the window's `layer_crop`, or all of it without one, as pending state committed with
+// the frame being drawn. A crop makes the layer surface its size, anchored top-left at its
+// origin, and crops the buffer to its top-left with wp_viewport. The compositor sees a surface
+// just that size for input, blur and damage, while the window keeps its size and swapchain.
+fn apply_layer_crop(state: &WaylandWindowState) {
+    let WaylandSurfaceState::LayerShell(layer_surface_state) = &state.surface_state else {
+        return;
+    };
+    let compositor = &state.globals.compositor;
+    let Some(crop) = state.layer_crop else {
+        layer_surface_state.send_state();
+        if let Some(viewport) = &state.viewport {
+            viewport.set_source(-1.0, -1.0, -1.0, -1.0);
+            viewport.set_destination(
+                f32::from(state.bounds.size.width) as i32,
+                f32::from(state.bounds.size.height) as i32,
+            );
+        }
+        state.surface.set_input_region(None);
+        set_blur_area(state, None);
+        return;
+    };
+    if crop.size.width <= 0 || crop.size.height <= 0 {
+        let region = compositor.create_region(&state.globals.qh, ());
+        state.surface.set_input_region(Some(&region));
+        region.destroy();
+        set_blur_area(state, Some(crop));
+        return;
+    }
+    let (width, height) = (crop.size.width, crop.size.height);
+    let layer_surface = &layer_surface_state.layer_surface;
+    layer_surface
+        .set_anchor(zwlr_layer_surface_v1::Anchor::Top | zwlr_layer_surface_v1::Anchor::Left);
+    layer_surface.set_size(width as u32, height as u32);
+    layer_surface.set_margin(crop.origin.y, 0, 0, crop.origin.x);
+    if let Some(viewport) = &state.viewport {
+        // In buffer coordinates, and within the buffer: device pixels under fractional
+        // scaling, where the buffer scale is 1, and logical pixels under an integer buffer
+        // scale.
+        let (scale, limit) = if state.globals.fractional_scale_manager.is_some() {
+            let device = state.bounds.to_device_pixels(state.scale).size;
+            (state.scale, (device.width.0 as f32, device.height.0 as f32))
+        } else {
+            let logical = state.bounds.size;
+            (1.0, (f32::from(logical.width), f32::from(logical.height)))
+        };
+        viewport.set_source(
+            0.0,
+            0.0,
+            f64::from((width as f32 * scale).min(limit.0)),
+            f64::from((height as f32 * scale).min(limit.1)),
+        );
+        viewport.set_destination(width, height);
+        state.surface.set_input_region(None);
+    } else {
+        // Without a viewport the surface stays the size of the buffer, so only its top-left
+        // takes input.
+        let region = compositor.create_region(&state.globals.qh, ());
+        region.add(0, 0, width, height);
+        state.surface.set_input_region(Some(&region));
+        region.destroy();
+    }
+    set_blur_area(
+        state,
+        Some(Bounds {
+            origin: Point::default(),
+            size: crop.size,
+        }),
+    );
+}
+
+// Blurs `area` of the surface, rounded by the client corner radii: all of it for `None`, and
+// nothing for an empty area.
+fn set_blur_area(state: &WaylandWindowState, area: Option<Bounds<i32>>) {
+    let Some(background_effects) = &state.background_effects else {
+        return;
+    };
+    let area = area.unwrap_or_else(|| {
+        state
+            .bounds
+            .map_origin(|_| px(0.0))
+            .map(|value| f32::from(value) as i32)
+    });
+    let region = state
+        .globals
+        .compositor
+        .create_region(&state.globals.qh, ());
+    if area.size.width > 0 && area.size.height > 0 {
+        add_rounded_rect(area, state.client_corner_radii, |x, y, width, height| {
+            region.add(x, y, width, height);
+        });
+    }
+    background_effects.set_blur_region(Some(&region));
+    region.destroy();
+}
+
 fn update_window(mut state: RefMut<WaylandWindowState>) {
     let opaque = !state.is_transparent();
 
@@ -2625,9 +2765,20 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
                 state.background_effects = Some(background_effects);
             }
 
-            add_rounded_rect(area, state.client_corner_radii, |x, y, width, height| {
-                region.add(x, y, width, height);
-            });
+            let blur_area = match state.layer_crop {
+                Some(crop) => Bounds {
+                    origin: Point::default(),
+                    size: crop.size,
+                },
+                None => area,
+            };
+            add_rounded_rect(
+                blur_area,
+                state.client_corner_radii,
+                |x, y, width, height| {
+                    region.add(x, y, width, height);
+                },
+            );
 
             state
                 .background_effects
