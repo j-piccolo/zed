@@ -262,6 +262,9 @@ pub struct WgpuRenderer {
     observed_error_generation: u64,
     last_surface_error: Option<String>,
     needs_redraw: bool,
+    /// Whether the swapchain is at 1x1 for a hidden window ([`Self::shrink_surface`]).
+    /// `surface_config` keeps the window's size.
+    surface_shrunk: bool,
 }
 
 impl WgpuRenderer {
@@ -515,6 +518,7 @@ impl WgpuRenderer {
             observed_error_generation: 0,
             last_surface_error: None,
             needs_redraw: false,
+            surface_shrunk: false,
         })
     }
 }
@@ -1069,6 +1073,10 @@ impl WgpuRenderer {
         // panics when the device/surface is in an invalid state during resize.
         resources.invalidate_intermediate_textures();
 
+        // A shrunk swapchain takes the new configuration when it is restored.
+        if self.surface_shrunk {
+            return;
+        }
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
         }
@@ -1107,6 +1115,10 @@ impl WgpuRenderer {
             core.uses_webgl_instance_data,
         );
 
+        // A shrunk swapchain takes the new configuration when it is restored.
+        if self.surface_shrunk {
+            return;
+        }
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
         }
@@ -2205,6 +2217,36 @@ impl WgpuRenderer {
         self.state = RendererState::Ready { surface, core };
 
         Ok(())
+    }
+
+    /// Shrinks the swapchain of a window that is hidden to 1x1 and frees its path textures,
+    /// keeping its surface, device, pipelines and atlas. A hidden window draws nothing, so its
+    /// window-sized images would only hold memory. Dropping the surface would free the same
+    /// memory, but creating a Vulkan Wayland surface again costs round trips to the compositor
+    /// before the next frame, while resizing the swapchain of the kept surface does not.
+    pub fn shrink_surface(&mut self) {
+        if self.surface_shrunk {
+            return;
+        }
+        if let RendererState::Ready { surface, core } = &mut self.state {
+            let mut shrunk_config = self.surface_config.clone();
+            shrunk_config.width = 1;
+            shrunk_config.height = 1;
+            surface.configure(&core.resources.device, &shrunk_config);
+            core.resources.invalidate_intermediate_textures();
+            self.surface_shrunk = true;
+        }
+    }
+
+    /// Gives a swapchain shrunk by [`Self::shrink_surface`] the window's size again, ready
+    /// for the frame that shows it.
+    pub fn restore_surface(&mut self) {
+        if !std::mem::take(&mut self.surface_shrunk) {
+            return;
+        }
+        if let RendererState::Ready { surface, core } = &self.state {
+            surface.configure(&core.resources.device, &self.surface_config);
+        }
     }
 
     pub fn destroy(&mut self) {
