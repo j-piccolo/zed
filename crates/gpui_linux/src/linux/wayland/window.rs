@@ -1134,6 +1134,7 @@ impl WaylandWindowStatePtr {
             self.frame_loop.set(FrameLoop::Parked);
             return;
         };
+        trace_frame("tick", self.state.borrow().handle.window_id());
         request_frame_callback(RequestFrameOptions {
             force_render,
             require_presentation,
@@ -1194,6 +1195,7 @@ impl WaylandWindowStatePtr {
         // Another wl_surface commit may have carried this callback while a retry
         // timer owned the render-loop wakeup.
         self.state.borrow_mut().pending_frame_callback = None;
+        trace_frame("shown", self.state.borrow().handle.window_id());
         // By its first frame callback, a shown layer surface has been mapped.
         self.start_requested_popup_grab();
         if self.frame_loop.get() == FrameLoop::AwaitingCallback {
@@ -2308,6 +2310,7 @@ impl PlatformWindow for WaylandWindow {
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
         let state = &mut *state;
+        trace_frame("scene", state.handle.window_id());
         // A crop asked for while drawing this frame is committed with it.
         if let Some(crop) = state.pending_layer_crop.take()
             && crop != state.layer_crop
@@ -2350,6 +2353,7 @@ impl PlatformWindow for WaylandWindow {
         if renderer.draw(scene) {
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
+            trace_frame("present", state.handle.window_id());
         } else {
             state.presentation = state.presentation.failed();
             self.0.frame_loop.set(FrameLoop::PresentationFailed);
@@ -2855,6 +2859,24 @@ fn set_blur_area(state: &WaylandWindowState, area: Option<Bounds<i32>>) {
     }
     background_effects.set_blur_region(Some(&region));
     region.destroy();
+}
+
+/// With `MYSHELL_FRAMES=causes`, a line as Myshell's own frame traces have it, for its latency
+/// benchmarks: `key` when a key press reaches the client, `tick` when GPUI's frame starts,
+/// `scene` when a painted scene reaches the renderer, `present` when the frame is handed to
+/// the compositor, and `shown` when the compositor's frame callback says it has drawn it.
+pub(crate) fn trace_frame(what: &str, window: gpui::WindowId) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED
+        .get_or_init(|| std::env::var_os("MYSHELL_FRAMES").is_some_and(|value| value == "causes"))
+    {
+        return;
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    eprintln!("myshell frame {at:.6} {what}: {window:?}");
 }
 
 fn update_window(mut state: RefMut<WaylandWindowState>) {

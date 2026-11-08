@@ -2398,6 +2398,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 let Some(focused_window) = focused_window else {
                     return;
                 };
+                if key_state == wl_keyboard::KeyState::Pressed {
+                    super::window::trace_frame("key", focused_window.handle().window_id());
+                }
 
                 let keymap_state = state.keymap_state.as_ref().unwrap();
                 let keycode = Keycode::from(key + MIN_KEYCODE);
