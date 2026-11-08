@@ -3,6 +3,7 @@ mod clipboard;
 mod cursor;
 mod display;
 mod popup;
+mod popup_grab;
 mod serial;
 mod window;
 

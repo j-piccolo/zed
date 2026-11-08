@@ -1389,6 +1389,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_input_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
     fn hide(&self) {}
     fn show(&self) {}
+    fn request_popup_grab(&self, _on_end: Box<dyn FnOnce()>) {}
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
     }
