@@ -100,6 +100,8 @@ struct GammaParams {
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+    /// Where texel (0, 0) of the path textures is in the frame, for this batch.
+    texture_origin: Point<ScaledPixels>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +111,43 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    /// As [`PathSprite::texture_origin`]. Gradients add it back to the fragment position.
+    texture_origin: Point<ScaledPixels>,
+}
+
+/// Path textures grow in steps of this many device pixels, so that a batch a little larger
+/// than the last does not reallocate them.
+const PATH_TEXTURE_STEP: u32 = 256;
+
+/// The device pixels a path batch draws into: the union of its paths' clipped bounds, out to
+/// whole pixels and within the frame. Its origin is texel (0, 0) of the path textures.
+fn path_batch_bounds(
+    paths: &[Path<ScaledPixels>],
+    frame: Size<DevicePixels>,
+) -> Bounds<DevicePixels> {
+    let mut bounds = paths[0].clipped_bounds();
+    for path in &paths[1..] {
+        bounds = bounds.union(&path.clipped_bounds());
+    }
+    let span = |start: f32, end: f32, frame: i32| {
+        let start = (start.floor() as i32).clamp(0, frame);
+        let end = (end.ceil() as i32).clamp(start, frame);
+        (DevicePixels(start), DevicePixels((end - start).max(1)))
+    };
+    let (x, width) = span(
+        bounds.origin.x.0,
+        bounds.origin.x.0 + bounds.size.width.0,
+        frame.width.0,
+    );
+    let (y, height) = span(
+        bounds.origin.y.0,
+        bounds.origin.y.0 + bounds.size.height.0,
+        frame.height.0,
+    );
+    Bounds {
+        origin: Point { x, y },
+        size: Size { width, height },
+    }
 }
 
 pub struct WgpuSurfaceConfig {
@@ -1056,19 +1095,6 @@ impl WgpuRenderer {
             warn!("Failed to poll device during resize: {e:?}");
         }
 
-        // Destroy old textures before allocating new ones to avoid GPU memory spikes
-        if let Some(ref texture) = resources.path_intermediate_texture {
-            texture.destroy();
-        }
-        if let Some(ref texture) = resources.path_msaa_texture {
-            texture.destroy();
-        }
-
-        // Invalidate intermediate textures - they will be lazily recreated
-        // in draw() after we confirm the surface is healthy. This avoids
-        // panics when the device/surface is in an invalid state during resize.
-        resources.invalidate_intermediate_textures();
-
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
         }
@@ -1402,19 +1428,30 @@ impl WgpuRendererCore {
         &mut self.resources
     }
 
-    /// Path rendering goes through an intermediate texture that must match the frame
-    /// target's dimensions, so the textures are keyed by size and rebuilt on mismatch.
-    fn ensure_intermediate_textures(&mut self, size: Size<DevicePixels>) {
-        let width = size.width.0 as u32;
-        let height = size.height.0 as u32;
-        if self
+    /// Path batches are rasterized into an intermediate texture (and its MSAA counterpart)
+    /// at their own bounds rather than the frame's, so the textures only need to fit the
+    /// largest batch. They are kept between frames and only grow, in `PATH_TEXTURE_STEP`s
+    /// capped at the frame size.
+    fn ensure_path_textures(&mut self, needed: Size<DevicePixels>, frame: Size<DevicePixels>) {
+        let (current_width, current_height) = self
             .resources
             .path_intermediate_texture
             .as_ref()
-            .is_some_and(|texture| texture.width() == width && texture.height() == height)
-        {
+            .map_or((0, 0), |texture| (texture.width(), texture.height()));
+        let needed_width = needed.width.0.max(1) as u32;
+        let needed_height = needed.height.0.max(1) as u32;
+        if needed_width <= current_width && needed_height <= current_height {
             return;
         }
+        let grow = |current: u32, needed: u32, frame: i32| {
+            needed
+                .next_multiple_of(PATH_TEXTURE_STEP)
+                .min(frame.max(1) as u32)
+                .max(needed)
+                .max(current)
+        };
+        let width = grow(current_width, needed_width, frame.width.0);
+        let height = grow(current_height, needed_height, frame.height.0);
 
         let format = self.target_format;
         let path_sample_count = self.rendering_params.path_sample_count;
@@ -1458,7 +1495,6 @@ impl WgpuRendererCore {
         );
 
         self.atlas.before_frame();
-        self.ensure_intermediate_textures(size);
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1492,7 +1528,7 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, clear_color)
+        self.record_frame(scene, target_view, size, clear_color)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
@@ -1503,6 +1539,7 @@ impl WgpuRendererCore {
         &mut self,
         scene: &Scene,
         frame_view: &wgpu::TextureView,
+        frame_size: Size<DevicePixels>,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset = 0;
@@ -1520,7 +1557,10 @@ impl WgpuRendererCore {
                     scene.polychrome_sprites.len(),
                 )
             })?;
-        self.prepare_texture_bind_groups(scene);
+        let path_texture_size = self.prepare_texture_bind_groups(scene, frame_size);
+        if let Some(size) = path_texture_size {
+            self.ensure_path_textures(size, frame_size);
+        }
 
         let mut encoder =
             self.resources()
@@ -1566,9 +1606,12 @@ impl WgpuRendererCore {
                         }
 
                         drop(pass);
+                        let batch_bounds = path_batch_bounds(paths, frame_size);
                         let rasterized = self.draw_paths_to_intermediate(
                             &mut encoder,
                             paths,
+                            batch_bounds.origin,
+                            frame_size,
                             &mut instance_offset,
                         )?;
 
@@ -1590,6 +1633,7 @@ impl WgpuRendererCore {
                         if rasterized {
                             self.draw_paths_from_intermediate(
                                 paths,
+                                batch_bounds.origin,
                                 &mut instance_offset,
                                 &mut pass,
                             )?;
@@ -1710,13 +1754,28 @@ impl WgpuRendererCore {
             })
     }
 
-    fn prepare_texture_bind_groups(&mut self, scene: &Scene) {
+    /// Also returns the size of the frame's largest path batch, which the path textures must
+    /// fit.
+    fn prepare_texture_bind_groups(
+        &mut self,
+        scene: &Scene,
+        frame_size: Size<DevicePixels>,
+    ) -> Option<Size<DevicePixels>> {
         let mut texture_ids = SmallVec::<[AtlasTextureId; 8]>::new();
+        let mut path_texture_size: Option<Size<DevicePixels>> = None;
         for batch in scene.batches() {
             let texture_id = match batch {
                 PrimitiveBatch::MonochromeSprites { texture_id, .. }
                 | PrimitiveBatch::SubpixelSprites { texture_id, .. }
                 | PrimitiveBatch::PolychromeSprites { texture_id, .. } => texture_id,
+                PrimitiveBatch::Paths(range) if !range.is_empty() => {
+                    let size = path_batch_bounds(&scene.paths[range], frame_size).size;
+                    path_texture_size = Some(path_texture_size.map_or(size, |largest| Size {
+                        width: largest.width.max(size.width),
+                        height: largest.height.max(size.height),
+                    }));
+                    continue;
+                }
                 _ => continue,
             };
             if !texture_ids.contains(&texture_id) {
@@ -1754,6 +1813,7 @@ impl WgpuRendererCore {
                 },
             );
         }
+        path_texture_size
     }
 
     fn draw_instances(
@@ -1816,9 +1876,14 @@ impl WgpuRendererCore {
     fn draw_paths_from_intermediate(
         &mut self,
         paths: &[Path<ScaledPixels>],
+        texture_origin: Point<DevicePixels>,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> Result<()> {
+        let texture_origin = Point {
+            x: ScaledPixels(texture_origin.x.0 as f32),
+            y: ScaledPixels(texture_origin.y.0 as f32),
+        };
         let first_path = &paths[0];
         let sprites: Vec<PathSprite> = if paths.last().map(|p| &p.order) == Some(&first_path.order)
         {
@@ -1826,6 +1891,7 @@ impl WgpuRendererCore {
                 .iter()
                 .map(|p| PathSprite {
                     bounds: p.clipped_bounds(),
+                    texture_origin,
                 })
                 .collect()
         } else {
@@ -1833,7 +1899,10 @@ impl WgpuRendererCore {
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            vec![PathSprite { bounds }]
+            vec![PathSprite {
+                bounds,
+                texture_origin,
+            }]
         };
 
         let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
@@ -1861,8 +1930,14 @@ impl WgpuRendererCore {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         paths: &[Path<ScaledPixels>],
+        texture_origin: Point<DevicePixels>,
+        frame_size: Size<DevicePixels>,
         instance_offset: &mut u64,
     ) -> Result<bool> {
+        let origin = Point {
+            x: ScaledPixels(texture_origin.x.0 as f32),
+            y: ScaledPixels(texture_origin.y.0 as f32),
+        };
         let mut vertices = Vec::new();
         for path in paths {
             let bounds = path.clipped_bounds();
@@ -1871,6 +1946,7 @@ impl WgpuRendererCore {
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                texture_origin: origin,
             }));
         }
 
@@ -1911,6 +1987,16 @@ impl WgpuRendererCore {
                 ..Default::default()
             });
 
+            // The vertex shader maps positions over the whole frame, so shift the viewport to
+            // put the batch's origin on texel (0, 0).
+            pass.set_viewport(
+                -origin.x.0,
+                -origin.y.0,
+                frame_size.width.0 as f32,
+                frame_size.height.0 as f32,
+                0.0,
+                1.0,
+            );
             pass.set_pipeline(&resources.pipelines.path_rasterization);
             pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
             pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
@@ -2801,6 +2887,72 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    fn rectangle_path(
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        color: impl Into<Background>,
+    ) -> Path<ScaledPixels> {
+        let mut path = Path::new(gpui::point(gpui::px(x), gpui::px(y)));
+        path.line_to(gpui::point(gpui::px(x + width), gpui::px(y)));
+        path.line_to(gpui::point(gpui::px(x + width), gpui::px(y + height)));
+        path.line_to(gpui::point(gpui::px(x), gpui::px(y + height)));
+        path.line_to(gpui::point(gpui::px(x), gpui::px(y)));
+        path.content_mask = ContentMask {
+            bounds: Bounds {
+                origin: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+                size: gpui::size(gpui::px(1024.0), gpui::px(1024.0)),
+            },
+        };
+        path.color = color.into();
+        path.scale(1.0)
+    }
+
+    /// Path batches are rasterized at their own bounds; they must still land where they
+    /// were drawn, with gradients evaluated in frame space.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_renderer_draws_offset_paths() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(rectangle_path(36.0, 4.0, 24.0, 24.0, gpui::red()));
+        scene.finish();
+
+        let image = renderer.render_scene_to_image(&scene, device_size(64, 32))?;
+        assert_pixel(&image, 48, 16, RED);
+        assert_pixel(&image, 30, 16, BLACK);
+        assert_pixel(&image, 48, 1, BLACK);
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(rectangle_path(
+            32.0,
+            0.0,
+            32.0,
+            32.0,
+            linear_gradient(
+                90.0,
+                linear_color_stop(gpui::red(), 0.0),
+                linear_color_stop(gpui::blue(), 1.0),
+            ),
+        ));
+        scene.finish();
+
+        let image = renderer.render_scene_to_image(&scene, device_size(64, 32))?;
+        let left = image.get_pixel(33, 16).0;
+        let right = image.get_pixel(62, 16).0;
+        assert!(
+            left[0] > left[2],
+            "left edge was {left:?}, expected mostly red"
+        );
+        assert!(
+            right[2] > right[0],
+            "right edge was {right:?}, expected mostly blue"
+        );
+        Ok(())
+    }
+
     #[test]
     fn webgl_shader_is_valid_wgsl_without_storage_buffers() {
         assert!(!WEBGL_SHADERS.contains("var<storage"));
@@ -2831,8 +2983,8 @@ mod tests {
     fn webgl_record_sizes_match_shader_word_strides() {
         assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
-        assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 28 * 4);
+        assert_eq!(std::mem::size_of::<PathSprite>(), 6 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
