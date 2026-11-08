@@ -7687,7 +7687,7 @@ dependencies = [
  "image",
  "itertools 0.14.0",
  "log",
- "naga",
+ "naga 30.0.0 (git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007)",
  "parking_lot",
  "profiling",
  "raw-window-handle",
@@ -11134,6 +11134,31 @@ checksum = "e5ce46fe64a9d73be07dcbe690a38ce1b293be448fd8ce1e6c1b8062c9f72c6a"
 [[package]]
 name = "naga"
 version = "30.0.0"
+source = "git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7#7441eaf8feabee413d36088c4e599202100098c7"
+dependencies = [
+ "arrayvec",
+ "bit-set 0.11.1",
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "codespan-reporting",
+ "half",
+ "hashbrown 0.17.1",
+ "indexmap 2.14.0",
+ "libm",
+ "log",
+ "naga-types 30.0.0 (git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7)",
+ "num-traits",
+ "once_cell",
+ "rustc-hash 1.1.0",
+ "spirv",
+ "thiserror 2.0.17",
+ "unicode-ident",
+]
+
+[[package]]
+name = "naga"
+version = "30.0.0"
 source = "git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007#cddb2f5d80dc0009b2ef6767635140cacf90a007"
 dependencies = [
  "arrayvec",
@@ -11147,13 +11172,23 @@ dependencies = [
  "indexmap 2.14.0",
  "libm",
  "log",
- "naga-types",
+ "naga-types 30.0.0 (git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007)",
  "num-traits",
  "once_cell",
  "rustc-hash 1.1.0",
- "spirv",
  "thiserror 2.0.17",
  "unicode-ident",
+]
+
+[[package]]
+name = "naga-types"
+version = "30.0.0"
+source = "git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7#7441eaf8feabee413d36088c4e599202100098c7"
+dependencies = [
+ "hashbrown 0.17.1",
+ "indexmap 2.14.0",
+ "rustc-hash 1.1.0",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -20515,7 +20550,7 @@ checksum = "a751b3277700db47d3e574514de2eced5e54dc8a5436a3bf7a0b248b2cee16f3"
 [[package]]
 name = "wgpu"
 version = "30.0.0"
-source = "git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007#cddb2f5d80dc0009b2ef6767635140cacf90a007"
+source = "git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7#7441eaf8feabee413d36088c4e599202100098c7"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.1",
@@ -20526,7 +20561,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "js-sys",
  "log",
- "naga",
+ "naga 30.0.0 (git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7)",
  "profiling",
  "raw-window-handle",
  "smallvec",
@@ -20543,7 +20578,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core"
 version = "30.0.0"
-source = "git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007#cddb2f5d80dc0009b2ef6767635140cacf90a007"
+source = "git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7#7441eaf8feabee413d36088c4e599202100098c7"
 dependencies = [
  "arrayvec",
  "bit-set 0.11.1",
@@ -20555,8 +20590,8 @@ dependencies = [
  "hashbrown 0.17.1",
  "indexmap 2.14.0",
  "log",
- "naga",
- "naga-types",
+ "naga 30.0.0 (git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7)",
+ "naga-types 30.0.0 (git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7)",
  "num-traits",
  "profiling",
  "raw-window-handle",
@@ -20578,7 +20613,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-apple"
 version = "30.0.0"
-source = "git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007#cddb2f5d80dc0009b2ef6767635140cacf90a007"
+source = "git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7#7441eaf8feabee413d36088c4e599202100098c7"
 dependencies = [
  "wgpu-hal",
 ]
@@ -20586,7 +20621,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-emscripten"
 version = "30.0.0"
-source = "git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007#cddb2f5d80dc0009b2ef6767635140cacf90a007"
+source = "git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7#7441eaf8feabee413d36088c4e599202100098c7"
 dependencies = [
  "wgpu-hal",
 ]
@@ -20594,7 +20629,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-linux-android-bsd"
 version = "30.0.0"
-source = "git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007#cddb2f5d80dc0009b2ef6767635140cacf90a007"
+source = "git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7#7441eaf8feabee413d36088c4e599202100098c7"
 dependencies = [
  "wgpu-hal",
 ]
@@ -20602,7 +20637,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-wasm"
 version = "30.0.0"
-source = "git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007#cddb2f5d80dc0009b2ef6767635140cacf90a007"
+source = "git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7#7441eaf8feabee413d36088c4e599202100098c7"
 dependencies = [
  "wgpu-hal",
 ]
@@ -20610,7 +20645,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-windows"
 version = "30.0.0"
-source = "git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007#cddb2f5d80dc0009b2ef6767635140cacf90a007"
+source = "git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7#7441eaf8feabee413d36088c4e599202100098c7"
 dependencies = [
  "wgpu-hal",
 ]
@@ -20618,7 +20653,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "30.0.0"
-source = "git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007#cddb2f5d80dc0009b2ef6767635140cacf90a007"
+source = "git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7#7441eaf8feabee413d36088c4e599202100098c7"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -20638,8 +20673,8 @@ dependencies = [
  "libc",
  "libloading",
  "log",
- "naga",
- "naga-types",
+ "naga 30.0.0 (git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7)",
+ "naga-types 30.0.0 (git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7)",
  "ndk-sys",
  "objc2 0.6.3",
  "objc2-core-foundation",
@@ -20647,7 +20682,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
- "ordered-float 5.5.0",
+ "ordered-float 4.6.0",
  "profiling",
  "range-alloc",
  "raw-window-handle",
@@ -20670,16 +20705,16 @@ dependencies = [
 [[package]]
 name = "wgpu-naga-bridge"
 version = "30.0.0"
-source = "git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007#cddb2f5d80dc0009b2ef6767635140cacf90a007"
+source = "git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7#7441eaf8feabee413d36088c4e599202100098c7"
 dependencies = [
- "naga",
+ "naga 30.0.0 (git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7)",
  "wgpu-types",
 ]
 
 [[package]]
 name = "wgpu-sync"
 version = "30.0.0"
-source = "git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007#cddb2f5d80dc0009b2ef6767635140cacf90a007"
+source = "git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7#7441eaf8feabee413d36088c4e599202100098c7"
 dependencies = [
  "cfg-if",
  "lock_api",
@@ -20692,14 +20727,14 @@ dependencies = [
 [[package]]
 name = "wgpu-types"
 version = "30.0.0"
-source = "git+https://github.com/gfx-rs/wgpu?rev=cddb2f5d80dc0009b2ef6767635140cacf90a007#cddb2f5d80dc0009b2ef6767635140cacf90a007"
+source = "git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7#7441eaf8feabee413d36088c4e599202100098c7"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
  "js-sys",
  "log",
  "macro_rules_attribute",
- "naga-types",
+ "naga-types 30.0.0 (git+https://github.com/j-piccolo/wgpu?rev=7441eaf8feabee413d36088c4e599202100098c7)",
  "raw-window-handle",
  "static_assertions",
  "web-sys",
