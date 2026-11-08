@@ -6943,6 +6943,15 @@ impl Window {
         self.platform_window.show();
     }
 
+    /// Whether a window hidden with [`Self::hide_window`] keeps its swapchain at full size.
+    /// By default its window-sized images are freed while it is hidden, and allocated again
+    /// before the first frame that shows it. Keeping them makes showing the window faster, at
+    /// the cost of that memory. It takes effect the next time the window is hidden.
+    /// (Wayland layer-shell windows only)
+    pub fn set_keep_swapchain_when_hidden(&self, keep: bool) {
+        self.platform_window.set_keep_swapchain_when_hidden(keep);
+    }
+
     /// Toggle full screen status on the current window at the platform level.
     pub fn toggle_fullscreen(&self) {
         self.platform_window.toggle_fullscreen();

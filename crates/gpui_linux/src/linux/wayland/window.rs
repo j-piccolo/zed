@@ -149,6 +149,7 @@ pub struct WaylandWindowState {
     /// Whether a hidden window has acked the configure for its next map, so that showing it
     /// can present at once.
     configured_while_hidden: bool,
+    keep_swapchain_when_hidden: bool,
 }
 
 pub enum WaylandSurfaceState {
@@ -686,6 +687,7 @@ impl WaylandWindowState {
             accesskit_adapter: None,
             hidden: false,
             configured_while_hidden: false,
+            keep_swapchain_when_hidden: false,
         })
     }
 
@@ -901,6 +903,11 @@ impl WaylandWindow {
             layer_surface_state.send_state();
         }
         state.surface.commit();
+        if !state.keep_swapchain_when_hidden
+            && let Some(renderer) = state.renderer.as_mut()
+        {
+            renderer.shrink_surface();
+        }
         drop(state);
         self.0.report_visibility_soon();
     }
@@ -914,6 +921,9 @@ impl WaylandWindow {
         }
         state.hidden = false;
         state.visibility = WindowVisibility::Visible;
+        if let Some(renderer) = state.renderer.as_mut() {
+            renderer.restore_surface();
+        }
         let configured = std::mem::take(&mut state.configured_while_hidden);
         if configured {
             state.redraw_requested = true;
@@ -985,6 +995,9 @@ impl WaylandWindow {
             let mut state = this.borrow_mut();
             state.hidden = true;
             state.visibility = WindowVisibility::Hidden;
+            if let Some(renderer) = state.renderer.as_mut() {
+                renderer.shrink_surface();
+            }
         }
 
         // Kick things off
@@ -2275,6 +2288,10 @@ impl PlatformWindow for WaylandWindow {
         if self.borrow().surface_state.layer_surface().is_some() {
             self.show_layer_surface();
         }
+    }
+
+    fn set_keep_swapchain_when_hidden(&self, keep: bool) {
+        self.borrow_mut().keep_swapchain_when_hidden = keep;
     }
 
     fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {

@@ -1389,6 +1389,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_input_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
     fn hide(&self) {}
     fn show(&self) {}
+    fn set_keep_swapchain_when_hidden(&self, _keep: bool) {}
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
     }
