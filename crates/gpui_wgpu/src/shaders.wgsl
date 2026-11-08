@@ -1052,6 +1052,8 @@ struct PathRasterizationVertex {
     st_position: vec2<f32>,
     color: Background,
     bounds: Bounds,
+    // Where texel (0, 0) of the path texture is in the frame, for this batch.
+    texture_origin: vec2<f32>,
 }
 
 
@@ -1104,7 +1106,9 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         background.solid,
         background.colors,
     );
-    let color = gradient_color(background, input.position.xy, bounds,
+    // The viewport moved the batch to the texture's origin, but gradients are evaluated in
+    // frame space.
+    let color = gradient_color(background, input.position.xy + v.texture_origin, bounds,
         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
     return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
 }
@@ -1113,6 +1117,8 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
 
 struct PathSprite {
     bounds: Bounds,
+    // Where texel (0, 0) of the path texture is in the frame, for this batch.
+    texture_origin: vec2<f32>,
 }
 
 
@@ -1127,9 +1133,11 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     let sprite = load_path_sprite(instance_id);
     // Don't apply content mask because it was already accounted for when rasterizing the path.
     let device_position = to_device_position(unit_vertex, sprite.bounds);
-    // For screen-space intermediate texture, convert screen position to texture coordinates
+    // The intermediate texture holds this batch with its origin at texel (0, 0), and is not
+    // the size of the frame.
     let screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    let texture_coords = screen_position / globals.viewport_size;
+    let texture_coords = (screen_position - sprite.texture_origin)
+        / vec2<f32>(textureDimensions(t_sprite));
 
     var out = PathVarying();
     out.position = device_position;
