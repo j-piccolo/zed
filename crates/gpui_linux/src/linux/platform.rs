@@ -792,6 +792,19 @@ impl Platform for LinuxPlatform {
         self.connection.borrow().screen_capture_sources()
     }
 
+    #[cfg(feature = "wayland")]
+    fn lock_session(
+        &self,
+        on_event: Box<dyn FnMut(gpui::session_lock::SessionLockEvent)>,
+    ) -> anyhow::Result<()> {
+        self.connection.borrow().lock_session(on_event)
+    }
+
+    #[cfg(feature = "wayland")]
+    fn unlock_session(&self) {
+        self.connection.borrow().unlock_session();
+    }
+
     fn active_window(&self) -> Option<AnyWindowHandle> {
         self.connection.borrow().active_window()
     }

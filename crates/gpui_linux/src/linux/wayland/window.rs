@@ -19,6 +19,9 @@ use wayland_client::{
     protocol::{wl_callback, wl_output, wl_seat, wl_surface},
 };
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1;
+use wayland_protocols::ext::session_lock::v1::client::{
+    ext_session_lock_surface_v1, ext_session_lock_v1,
+};
 use wayland_protocols::wp::viewporter::client::wp_viewport;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::client::xdg_popup;
@@ -43,7 +46,9 @@ use gpui::{
     WindowKind, WindowParams, WindowVisibility,
     layer_shell::{Anchor, LayerShellNotSupportedError, LayerShellOptions},
     popup::PopupOptions,
-    px, size,
+    px,
+    session_lock::LockSurfaceError,
+    size,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 
@@ -165,6 +170,7 @@ pub enum WaylandSurfaceState {
     Xdg(WaylandXdgSurfaceState),
     LayerShell(WaylandLayerSurfaceState),
     Popup(WaylandPopupSurfaceState),
+    LockSurface(ext_session_lock_surface_v1::ExtSessionLockSurfaceV1),
 }
 
 impl WaylandSurfaceState {
@@ -175,7 +181,19 @@ impl WaylandSurfaceState {
         parent: Option<WaylandWindowStatePtr>,
         popup_grab: Option<(u32, wl_seat::WlSeat)>,
         target_output: Option<wl_output::WlOutput>,
+        session_lock: Option<ext_session_lock_v1::ExtSessionLockV1>,
     ) -> anyhow::Result<Self> {
+        if params.kind == WindowKind::LockSurface {
+            let Some(lock) = session_lock else {
+                return Err(LockSurfaceError::NotLocking.into());
+            };
+            let Some(output) = target_output else {
+                return Err(LockSurfaceError::NoDisplay.into());
+            };
+            let lock_surface = lock.get_lock_surface(surface, &output, &globals.qh, surface.id());
+            return Ok(WaylandSurfaceState::LockSurface(lock_surface));
+        }
+
         // For layer_shell windows, create a layer surface instead of an xdg surface
         if let WindowKind::LayerShell(options) = &params.kind {
             let Some(layer_shell) = globals.layer_shell.as_ref() else {
@@ -419,6 +437,9 @@ impl WaylandSurfaceState {
             WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState { layer_surface, .. }) => {
                 layer_surface.ack_configure(serial);
             }
+            WaylandSurfaceState::LockSurface(lock_surface) => {
+                lock_surface.ack_configure(serial);
+            }
             WaylandSurfaceState::Popup(WaylandPopupSurfaceState { xdg_surface, .. }) => {
                 xdg_surface.ack_configure(serial);
             }
@@ -449,7 +470,7 @@ impl WaylandSurfaceState {
             WaylandSurfaceState::Popup(WaylandPopupSurfaceState { xdg_surface, .. }) => {
                 Some(xdg_surface)
             }
-            WaylandSurfaceState::LayerShell(_) => None,
+            WaylandSurfaceState::LayerShell(_) | WaylandSurfaceState::LockSurface(_) => None,
         }
     }
 
@@ -487,6 +508,8 @@ impl WaylandSurfaceState {
             WaylandSurfaceState::Popup(WaylandPopupSurfaceState { xdg_surface, .. }) => {
                 xdg_surface.set_window_geometry(x, y, width, height);
             }
+            // A lock surface is the size the compositor configures, and covers its output.
+            WaylandSurfaceState::LockSurface(_) => {}
         }
     }
 
@@ -596,6 +619,9 @@ impl WaylandSurfaceState {
                 // Role object before its xdg_surface, as with the toplevel above.
                 xdg_popup.destroy();
                 xdg_surface.destroy();
+            }
+            WaylandSurfaceState::LockSurface(lock_surface) => {
+                lock_surface.destroy();
             }
         }
     }
@@ -980,6 +1006,7 @@ impl WaylandWindow {
         parent: Option<WaylandWindowStatePtr>,
         popup_grab: Option<(u32, wl_seat::WlSeat)>,
         target_output: Option<wl_output::WlOutput>,
+        session_lock: Option<ext_session_lock_v1::ExtSessionLockV1>,
     ) -> anyhow::Result<(Self, ObjectId)> {
         let surface = globals.compositor.create_surface(&globals.qh, ());
         let surface_state = WaylandSurfaceState::new(
@@ -989,7 +1016,9 @@ impl WaylandWindow {
             parent.clone(),
             popup_grab,
             target_output,
+            session_lock,
         )?;
+        let configured_unasked = matches!(surface_state, WaylandSurfaceState::LockSurface(_));
 
         if let Some(fractional_scale_manager) = globals.fractional_scale_manager.as_ref() {
             fractional_scale_manager.get_fractional_scale(&surface, &globals.qh, surface.id());
@@ -1032,8 +1061,11 @@ impl WaylandWindow {
             }
         }
 
-        // Kick things off
-        surface.commit();
+        // Kick things off: an xdg or layer surface is configured once it commits. A lock surface
+        // is configured unasked, and a commit before acking that is a protocol error.
+        if !configured_unasked {
+            surface.commit();
+        }
 
         Ok((this, surface.id()))
     }
@@ -1580,6 +1612,26 @@ impl WaylandWindowStatePtr {
                 true
             }
             _ => false,
+        }
+    }
+
+    pub fn handle_lock_surface_event(&self, event: ext_session_lock_surface_v1::Event) {
+        if let ext_session_lock_surface_v1::Event::Configure {
+            serial,
+            width,
+            height,
+        } = event
+        {
+            // The compositor picks the size, the output's; the next frame must be exactly that.
+            self.state.borrow_mut().in_progress_configure = Some(InProgressConfigure {
+                size: Some(size(px(width as f32), px(height as f32))),
+                fullscreen: false,
+                maximized: false,
+                resizing: false,
+                visibility: WindowVisibility::Visible,
+                tiling: Tiling::default(),
+            });
+            self.handle_xdg_surface_event(xdg_surface::Event::Configure { serial });
         }
     }
 

@@ -1697,6 +1697,35 @@ impl App {
         self.platform.prevent_idle_sleep(reason)
     }
 
+    /// Asks the compositor to lock the session, as a screen locker (Wayland
+    /// `ext-session-lock-v1`). Open a [`WindowKind::LockSurface`](crate::WindowKind::LockSurface)
+    /// window on every display straight after: the compositor may wait for them to draw before it
+    /// locks. `on_event` hears when the lock takes hold, or that it ended or was refused.
+    ///
+    /// If the app exits or crashes while the session is locked, the session stays locked: the
+    /// compositor decides whether another locker may take over. One lock at a time.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    pub fn lock_session(
+        &self,
+        mut on_event: impl FnMut(crate::session_lock::SessionLockEvent, &mut App) + 'static,
+    ) -> Result<()> {
+        let app = self.this.clone();
+        self.platform.lock_session(Box::new(move |event| {
+            if let Some(app) = app.upgrade() {
+                app.borrow_mut().update(|cx| on_event(event, cx));
+            }
+        }))
+    }
+
+    /// Unlocks the session locked with [`App::lock_session`], and then closes the lock surface
+    /// windows' role. The lock's `on_event` hears
+    /// [`SessionLockEvent::Unlocked`](crate::session_lock::SessionLockEvent::Unlocked) once the
+    /// compositor has taken it.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    pub fn unlock_session(&self) {
+        self.platform.unlock_session();
+    }
+
     /// Invokes a handler when the thermal state changes
     pub fn on_thermal_state_change<F>(&self, mut callback: F) -> Subscription
     where

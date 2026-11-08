@@ -10,6 +10,10 @@ pub mod layer_shell;
 /// Types for configuring parent-anchored popup windows such as menus, dropdowns and tooltips.
 pub mod popup;
 
+/// Types for locking the session with a screen locker's own surfaces.
+#[cfg(all(target_os = "linux", feature = "wayland"))]
+pub mod session_lock;
+
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 mod threaded_dispatcher;
 
@@ -631,6 +635,19 @@ pub trait Platform: 'static {
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
+
+    /// Asks the compositor to lock the session; see [`App::lock_session`](crate::App::lock_session).
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    fn lock_session(
+        &self,
+        _on_event: Box<dyn FnMut(session_lock::SessionLockEvent)>,
+    ) -> Result<()> {
+        Err(session_lock::SessionLockNotSupportedError.into())
+    }
+
+    /// Unlocks a session locked with [`Platform::lock_session`].
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    fn unlock_session(&self) {}
 }
 
 /// A handle to a platform's display, e.g. a monitor or laptop screen.
@@ -2864,6 +2881,13 @@ pub enum WindowKind {
     /// docks, notifications or wallpapers.
     #[cfg(all(target_os = "linux", feature = "wayland"))]
     LayerShell(layer_shell::LayerShellOptions),
+
+    /// A Wayland session lock surface: a screen locker's window covering the output named by
+    /// [`WindowOptions::display_id`], shown while the app holds the session lock (see
+    /// [`App::lock_session`](crate::App::lock_session)). The compositor sets its size, and gives
+    /// it keyboard focus while it is the lock surface on the focused output.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    LockSurface,
 
     /// A window that appears on top of its parent window and blocks interaction with it
     /// until the modal window is closed
