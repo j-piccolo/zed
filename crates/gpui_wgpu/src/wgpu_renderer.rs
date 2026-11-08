@@ -1164,6 +1164,13 @@ impl WgpuRenderer {
             return false;
         };
 
+        // The atlas is shared with the other windows on this device. If one of them cleared it,
+        // this scene may name tiles that are gone or reused, so repaint in full first.
+        if self.atlas.take_cleared() {
+            self.needs_redraw = true;
+            return false;
+        }
+
         if let Some(error) = self.last_surface_error.take().or_else(|| {
             self.device_errors
                 .observe_error(&mut self.observed_error_generation)
