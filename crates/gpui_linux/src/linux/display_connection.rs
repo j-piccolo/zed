@@ -146,6 +146,24 @@ impl DisplayConnection {
         )
     }
 
+    #[cfg(feature = "wayland")]
+    pub(crate) fn lock_session(
+        &self,
+        on_event: Box<dyn FnMut(gpui::session_lock::SessionLockEvent)>,
+    ) -> anyhow::Result<()> {
+        match self {
+            DisplayConnection::Wayland(connection) => connection.lock_session(on_event),
+            _ => Err(gpui::session_lock::SessionLockNotSupportedError.into()),
+        }
+    }
+
+    #[cfg(feature = "wayland")]
+    pub(crate) fn unlock_session(&self) {
+        if let DisplayConnection::Wayland(connection) = self {
+            connection.unlock_session();
+        }
+    }
+
     pub(crate) fn active_window(&self) -> Option<AnyWindowHandle> {
         dispatch!(self, connection => connection.active_window(), headless => None)
     }
